@@ -1,0 +1,34 @@
+[package]
+name = "xutex"
+version = "0.1.0"
+edition = "2024"
+authors = ["Khashayar Fereidani"]
+description = "an extremely fast async mutex with alternative sync API"
+license = "MIT"
+repository = "https://github.com/fereidani/xutex"
+readme = "README.md"
+keywords = ["mutex", "thread", "async", "concurrency", "lock"]
+categories = ["concurrency", "asynchronous", "algorithms"]
+
+[dependencies]
+branches = "0.3"
+crossbeam-queue = "0.3"
+
+[dev-dependencies]
+criterion = "0.7"
+monoio = "0.2.4"
+swait = "0.1.4"
+tokio = { version = "1", features = ["full"] }
+
+[[bench]]
+name = "benchmark"
+harness = false
+
+[profile.release]
+opt-level = 3
+debug = false
+overflow-checks = false
+lto = 'thin'
+panic = 'abort'
+codegen-units = 1
+rpath = false
