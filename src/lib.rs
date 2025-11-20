@@ -82,7 +82,7 @@ impl QueueStructure {
     }
     pub fn acquire_guard(&self) -> QueueGuard<'_> {
         self.counter
-            .fetch_add(1, std::sync::atomic::Ordering::Release);
+            .fetch_add(1, std::sync::atomic::Ordering::Acquire);
         QueueGuard {
             counter: &self.counter,
         }
@@ -101,18 +101,18 @@ impl QueueGuard<'_> {
     /// Releases the queue guard and decrements the internal counter.
     ///
     /// This method consumes the `QueueGuard` and performs cleanup by:
-    /// - Decrementing the associated atomic counter using release ordering
     /// - Dropping the provided mutex guard to release the lock on the signal
     ///   queue
+    /// - Decrementing the associated atomic counter using release ordering
     ///
     /// # Arguments
     ///
     /// * `mutex_guard` - A mutex guard protecting the `SignalQueue` that will
     ///   be released
     pub fn release(self, mutex_guard: std::sync::MutexGuard<'_, SignalQueue>) {
+        drop(mutex_guard);
         self.counter
             .fetch_sub(1, std::sync::atomic::Ordering::Release);
-        drop(mutex_guard)
     }
 }
 
@@ -523,7 +523,7 @@ impl<T> Mutex<T> {
 
     #[cold]
     #[inline(never)]
-    fn lock_slow(&self) -> MutexGuard<'_, T> {
+    fn lock_slow(&self) {
         let mut entry = Signal::new_sync();
         let mutex = &self.internal;
         let backoff = Backoff::new();
@@ -534,7 +534,7 @@ impl<T> Mutex<T> {
                     .compare_exchange(UNLOCKED, LOCKED, Ordering::AcqRel, Ordering::Acquire);
 
             if likely(locking_result.is_ok()) {
-                return unsafe { mutex.create_guard() };
+                return;
             }
 
             let mut ptr = locking_result.unwrap_err();
@@ -603,18 +603,18 @@ impl<T> Mutex<T> {
                 let backoff = Backoff::new();
                 while !backoff.is_completed() {
                     if entry.value.load(Ordering::Acquire) == SIGNAL_SIGNALED {
-                        return unsafe { mutex.create_guard() };
+                        return;
                     }
                     backoff.snooze();
                 }
             }
             if entry.value.swap(SIGNAL_INIT_WAITING, Ordering::AcqRel) == SIGNAL_SIGNALED {
-                return unsafe { mutex.create_guard() };
+                return;
             }
             loop {
                 std::thread::park();
                 if entry.value.load(Ordering::Acquire) == SIGNAL_SIGNALED {
-                    return unsafe { mutex.create_guard() };
+                    return;
                 }
             }
         }
@@ -644,7 +644,15 @@ impl<T> Mutex<T> {
         if let Some(guard) = self.internal.try_lock() {
             return guard;
         }
-        self.lock_slow()
+        if unlikely(
+            self.internal
+                .queue
+                .compare_exchange(UNLOCKED, LOCKED, Ordering::Acquire, Ordering::Relaxed)
+                .is_err(),
+        ) {
+            self.lock_slow();
+        }
+        return unsafe { self.internal.create_guard() };
     }
 
     /// Attempts to acquire the mutex without blocking.

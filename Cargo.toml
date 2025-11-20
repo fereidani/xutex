@@ -1,6 +1,6 @@
 [package]
 name = "xutex"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 authors = ["Khashayar Fereidani"]
 description = "an extremely fast async mutex with alternative sync API"
@@ -16,9 +16,10 @@ crossbeam-queue = "0.3"
 
 [dev-dependencies]
 criterion = "0.7"
-monoio = "0.2.4"
-swait = "0.1.4"
+monoio = "0.2"
+swait = "0.1"
 tokio = { version = "1", features = ["full"] }
+parking_lot = "0"
 
 [[bench]]
 name = "benchmark"
