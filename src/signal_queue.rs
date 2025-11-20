@@ -91,9 +91,4 @@ impl SignalQueue {
         }
         false
     }
-    /// Checks if the queue is empty.
-    #[inline(always)]
-    pub fn is_empty(&self) -> bool {
-        self.first.is_none()
-    }
 }

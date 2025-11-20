@@ -31,24 +31,6 @@ pub(crate) struct Signal {
     _pinned: PhantomPinned,
 }
 
-#[inline]
-/// # Safety
-///
-/// The caller must guarantee that `m` points to a valid `std::sync::Mutex<T>`
-/// that lives for at least the lifetime `'a` of the returned guard.
-///
-/// This function converts the raw pointer into a reference and then obtains a
-/// `MutexGuard` without performing poisoning checks.
-unsafe fn lock_unpoisoned<'a>(m: *const QueueStructure) -> std::sync::MutexGuard<'a, SignalQueue> {
-    // SAFETY: the caller ensures `m` is valid for `'a`.
-    unsafe {
-        match (&*m).inner.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        }
-    }
-}
-
 impl Signal {
     pub fn new_none() -> Self {
         Self {
@@ -69,50 +51,14 @@ impl Signal {
 }
 
 struct QueueStructure {
-    pub counter: AtomicUsize,
-    pub inner: std::sync::Mutex<SignalQueue>,
+    pub inner: UnsafeCell<SignalQueue>,
 }
 
 impl QueueStructure {
     const fn new() -> Self {
         Self {
-            counter: AtomicUsize::new(0),
-            inner: std::sync::Mutex::new(SignalQueue::new()),
+            inner: UnsafeCell::new(SignalQueue::new()),
         }
-    }
-    pub fn acquire_guard(&self) -> QueueGuard<'_> {
-        self.counter
-            .fetch_add(1, std::sync::atomic::Ordering::Acquire);
-        QueueGuard {
-            counter: &self.counter,
-        }
-    }
-    pub fn read_counter(&self) -> usize {
-        self.counter.load(std::sync::atomic::Ordering::Acquire)
-    }
-}
-
-#[must_use]
-pub(crate) struct QueueGuard<'a> {
-    pub counter: &'a AtomicUsize,
-}
-
-impl QueueGuard<'_> {
-    /// Releases the queue guard and decrements the internal counter.
-    ///
-    /// This method consumes the `QueueGuard` and performs cleanup by:
-    /// - Dropping the provided mutex guard to release the lock on the signal
-    ///   queue
-    /// - Decrementing the associated atomic counter using release ordering
-    ///
-    /// # Arguments
-    ///
-    /// * `mutex_guard` - A mutex guard protecting the `SignalQueue` that will
-    ///   be released
-    pub fn release(self, mutex_guard: std::sync::MutexGuard<'_, SignalQueue>) {
-        drop(mutex_guard);
-        self.counter
-            .fetch_sub(1, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -271,17 +217,15 @@ impl<'a, T> AsyncLockRequest<'a, T> {
                 continue;
             }
 
-            let queue_guard = unsafe { (&*ptr).acquire_guard() };
-            // Untag the queue we have guard
-            self.mutex.queue.store(ptr, Ordering::Release);
-
             // Remove ourselves from the queue
             let result = unsafe {
-                let mut queue = lock_unpoisoned(ptr);
-                let res = queue.remove(NonNull::new_unchecked(&mut self.entry));
-                queue_guard.release(queue);
-                res
+                // SAFETY: ptr is tagged and we have exclusive access
+                let queue = (&mut *ptr).inner.get_mut();
+
+                queue.remove(NonNull::new_unchecked(&mut self.entry))
             };
+            // Untag the queue we have guard
+            self.mutex.queue.store(ptr, Ordering::Release);
 
             return result;
         }
@@ -304,7 +248,6 @@ impl<'a, T> Future for AsyncLockRequest<'a, T> {
             this.entry.value.store(SIGNAL_RETURNED, Ordering::Relaxed);
             return Poll::Ready(unsafe { this.mutex.create_guard() });
         }
-        let queue_guard: QueueGuard<'_>;
         if sig_val == SIGNAL_INIT_WAITING {
             this.entry.waker.register(cx.waker());
             Poll::Pending
@@ -343,8 +286,6 @@ impl<'a, T> Future for AsyncLockRequest<'a, T> {
                     }
 
                     ptr = Box::leak(allocate_queue());
-                    queue_guard = unsafe { (&*ptr).acquire_guard() };
-                    this.mutex.queue.store(ptr, Ordering::Release);
                 } else {
                     let is_tagged;
                     (ptr, is_tagged) = untag_pointer(ptr);
@@ -366,9 +307,6 @@ impl<'a, T> Future for AsyncLockRequest<'a, T> {
                     if tagging_result.is_err() {
                         continue;
                     }
-                    queue_guard = unsafe { (&*ptr).acquire_guard() };
-                    // untag
-                    this.mutex.queue.store(ptr, Ordering::Release);
                 }
 
                 this.entry
@@ -377,7 +315,10 @@ impl<'a, T> Future for AsyncLockRequest<'a, T> {
 
                 this.entry.waker.register(cx.waker());
 
-                let mut queue = unsafe { lock_unpoisoned(ptr) };
+                let queue = unsafe {
+                    // SAFETY: ptr is tagged and we have exclusive access
+                    (&mut *ptr).inner.get_mut()
+                };
 
                 unsafe {
                     // SAFETY: We guarantee that the entry lives long enough, or is removed from the
@@ -386,7 +327,7 @@ impl<'a, T> Future for AsyncLockRequest<'a, T> {
                     queue.push(NonNull::new_unchecked(&mut this.entry));
                 }
 
-                queue_guard.release(queue);
+                this.mutex.queue.store(ptr, Ordering::Release);
 
                 return Poll::Pending;
             }
@@ -543,28 +484,27 @@ impl<T> Mutex<T> {
             }
 
             let mut ptr = locking_result.unwrap_err();
-            let queue_guard: QueueGuard<'_>;
+
+            if ptr == UPDATING {
+                backoff.snooze();
+                continue;
+            }
 
             if ptr == LOCKED {
                 // init queue
-                let q = allocate_queue();
-                ptr = Box::leak(q) as *mut QueueStructure;
-                let tagged_ptr = tag_pointer(ptr);
-                let q_init_result = mutex.queue.compare_exchange(
+                let updating_token_init_result = mutex.queue.compare_exchange(
                     LOCKED,
-                    tagged_ptr,
+                    UPDATING,
                     Ordering::Acquire,
                     Ordering::Relaxed,
                 );
-                // deallocate if failed
-                if unlikely(q_init_result.is_err()) {
-                    // SAFETY: ptr is valid as it was just allocated
-                    deallocate_queue(unsafe { Box::from_raw(ptr) });
+
+                if unlikely(updating_token_init_result.is_err()) {
+                    backoff.snooze();
                     continue;
                 }
-                queue_guard = unsafe { (&*ptr).acquire_guard() };
-                // untag
-                mutex.queue.store(ptr, Ordering::Release);
+
+                ptr = Box::leak(allocate_queue());
             } else {
                 let is_tagged;
                 (ptr, is_tagged) = untag_pointer(ptr);
@@ -587,13 +527,12 @@ impl<T> Mutex<T> {
                     backoff.snooze();
                     continue;
                 }
-
-                queue_guard = unsafe { (&*ptr).acquire_guard() };
-                // untag
-                mutex.queue.store(ptr, Ordering::Release);
             }
 
-            let mut queue = unsafe { lock_unpoisoned(ptr) };
+            let queue = unsafe {
+                // SAFETY: ptr is tagged and we have exclusive access
+                (&mut *ptr).inner.get_mut()
+            };
 
             let do_spin = unsafe {
                 // SAFETY: We guarantee that the entry lives long enough by blocking here
@@ -601,7 +540,7 @@ impl<T> Mutex<T> {
                 queue.push(NonNull::new_unchecked(&mut entry))
             };
 
-            queue_guard.release(queue);
+            mutex.queue.store(ptr, Ordering::Release);
 
             // if we are first in the queue, we can try to spin before parking
             if do_spin {
@@ -657,7 +596,7 @@ impl<T> Mutex<T> {
         ) {
             self.lock_slow();
         }
-        return unsafe { self.internal.create_guard() };
+        unsafe { self.internal.create_guard() }
     }
 
     /// Attempts to acquire the mutex without blocking.
@@ -1169,85 +1108,78 @@ impl<'a, T> MutexGuard<'a, T> {
     #[inline(never)]
     fn drop_slow(&mut self) {
         let backoff = Backoff::new();
-        loop {
-            let unlock_result = self.mutex.queue.compare_exchange(
-                LOCKED,
-                UNLOCKED,
-                Ordering::Release,
-                Ordering::Acquire,
-            );
-            if likely(unlock_result.is_ok()) {
-                return;
-            }
-            let ptr = unlock_result.unwrap_err();
-            if ptr == UPDATING {
-                backoff.snooze();
-                continue;
-            }
-            let (ptr, is_tagged) = untag_pointer(ptr);
-            // only single writer so we will not check if pointer is going to get free
-            // as we are the only one who can write into it.
-            let mut queue = unsafe { lock_unpoisoned(&*ptr) };
-            if let Some(entry) = queue.pop() {
-                drop(queue);
-                unsafe {
-                    // SAFETY: entry is valid as it was pushed by a waiting task
-                    let entry_ref = entry.as_ref();
-                    // signal the waker to wake up, first acquire waker so if after signal waiter
-                    // finished their function, it will be no race condition.
-                    let waker = entry_ref.waker.take();
+        let unlock_result = self.mutex.queue.compare_exchange(
+            LOCKED,
+            UNLOCKED,
+            Ordering::Release,
+            Ordering::Acquire,
+        );
+        if likely(unlock_result.is_ok()) {
+            return;
+        }
+        let mut ptr = unlock_result.unwrap_err();
+        while ptr == UPDATING {
+            backoff.snooze();
+            ptr = self.mutex.queue.load(Ordering::Acquire);
+        }
 
-                    match waker {
-                        WakerSlot::None => {}
-                        WakerSlot::Sync(thread) => {
-                            if entry_ref.value.swap(SIGNAL_SIGNALED, Ordering::AcqRel)
-                                == SIGNAL_INIT_WAITING
-                            {
-                                thread.unpark();
-                            }
-                        }
-                        WakerSlot::Async(waker) => {
-                            entry_ref.value.store(SIGNAL_SIGNALED, Ordering::Release);
-                            waker.wake();
+        (ptr, _) = untag_pointer(ptr);
+
+        // tag pointer
+        let tagged_ptr = tag_pointer(ptr);
+
+        loop {
+            let tagging_result = self.mutex.queue.compare_exchange(
+                ptr,
+                tagged_ptr,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            );
+            if likely(tagging_result.is_ok()) {
+                break;
+            }
+            backoff.snooze();
+        }
+
+        let queue = unsafe {
+            // SAFETY: ptr is tagged and we have exclusive access
+            &mut *ptr
+        }
+        .inner
+        .get_mut();
+
+        if let Some(entry) = queue.pop() {
+            // untag pointer
+            self.mutex.queue.store(ptr, Ordering::Release);
+            unsafe {
+                // SAFETY: entry is valid as it was pushed by a waiting task
+                let entry_ref = entry.as_ref();
+                // signal the waker to wake up, first acquire waker so if after signal waiter
+                // finished their function, it will be no race condition.
+                let waker = entry_ref.waker.take();
+
+                match waker {
+                    WakerSlot::None => {}
+                    WakerSlot::Sync(thread) => {
+                        if entry_ref.value.swap(SIGNAL_SIGNALED, Ordering::AcqRel)
+                            == SIGNAL_INIT_WAITING
+                        {
+                            thread.unpark();
                         }
                     }
-                }
-                return;
-            } else {
-                if is_tagged {
-                    // some thread is writing into the queue
-                    backoff.snooze();
-                    continue;
-                }
-                let tagged_ptr = tag_pointer(ptr);
-                // reserve the queue so no one else writes into it.
-                let tagging_result = self.mutex.queue.compare_exchange(
-                    ptr,
-                    tagged_ptr,
-                    Ordering::Acquire,
-                    Ordering::Relaxed,
-                );
-                // wait for waker to be available in the queue
-                if unlikely(tagging_result.is_err()) {
-                    backoff.snooze();
-                    continue;
-                }
-                let counter = unsafe { &*ptr }.read_counter();
-                // nothing is in the queue and no one is pushing into it
-                if counter == 0 && queue.is_empty() {
-                    // queue is untouched it is possible to release the queue and unlock
-                    self.mutex.queue.store(UNLOCKED, Ordering::Release);
-                    // SAFETY: this section is sole owner of the queue and queue is_empty
-                    unsafe {
-                        // no clean up needed as when is_empty is met, both first and last are None
-                        deallocate_queue(Box::from_raw(ptr));
+                    WakerSlot::Async(waker) => {
+                        entry_ref.value.store(SIGNAL_SIGNALED, Ordering::Release);
+                        waker.wake();
                     }
-                    return;
-                } else {
-                    // someone written into the queue meanwhile, release it back for others
-                    self.mutex.queue.store(ptr, Ordering::Release);
-                    continue;
                 }
+            }
+        } else {
+            // queue is untouched it is possible to release the queue and unlock
+            self.mutex.queue.store(UNLOCKED, Ordering::Release);
+            // SAFETY: this section is sole owner of the queue and queue is_empty
+            unsafe {
+                // no clean up needed as when is_empty is met, both first and last are None
+                deallocate_queue(Box::from_raw(ptr));
             }
         }
     }
