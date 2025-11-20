@@ -20,6 +20,17 @@ fn benchmark_std_mutex_uncontended(c: &mut Criterion) {
     });
 }
 
+fn benchmark_parkinglot_mutex_uncontended(c: &mut Criterion) {
+    c.bench_function("parkinglot_mutex_uncontended", |b| {
+        let mutex = parking_lot::Mutex::new(0);
+        b.iter(|| {
+            let mut guard = mutex.lock();
+            *guard += 1;
+            black_box(*guard);
+        });
+    });
+}
+
 fn benchmark_xutex_uncontended(c: &mut Criterion) {
     c.bench_function("xutex_uncontended", |b| {
         let mutex = Mutex::new(0);
@@ -41,6 +52,27 @@ fn benchmark_std_mutex_contended(c: &mut Criterion) {
                 handles.push(thread::spawn(move || {
                     for _ in 0..100 {
                         let mut guard = mutex.lock().unwrap();
+                        *guard += 1;
+                    }
+                }));
+            }
+            for handle in handles {
+                handle.join().unwrap();
+            }
+        });
+    });
+}
+
+fn benchmark_parkinglot_mutex_contended(c: &mut Criterion) {
+    c.bench_function("parkinglot_mutex_contended", |b| {
+        let mutex = Arc::new(parking_lot::Mutex::new(0));
+        b.iter(|| {
+            let mut handles = vec![];
+            for _ in 0..THREAD_COUNT {
+                let mutex = Arc::clone(&mutex);
+                handles.push(thread::spawn(move || {
+                    for _ in 0..100 {
+                        let mut guard = mutex.lock();
                         *guard += 1;
                     }
                 }));
@@ -262,8 +294,10 @@ fn benchmark_xutex_try_lock(c: &mut Criterion) {
 criterion_group!(
     benches,
     benchmark_std_mutex_uncontended,
+    benchmark_parkinglot_mutex_uncontended,
     benchmark_xutex_uncontended,
     benchmark_std_mutex_contended,
+    benchmark_parkinglot_mutex_contended,
     benchmark_xutex_contended,
     benchmark_tokionative_contended_tokio,
     benchmark_tokionative_contended_tokio_current_thread,
