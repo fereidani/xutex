@@ -1,6 +1,6 @@
 [package]
 name = "xutex"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 authors = ["Khashayar Fereidani"]
 description = "an extremely fast async mutex with alternative sync API"
