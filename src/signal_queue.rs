@@ -22,22 +22,25 @@ impl SignalQueue {
     }
 
     /// Pushes a signal entry into the queue.
-    /// SAFETY: The caller must ensure that the entry lives long enough in the
+    /// 
+    /// # Safety
+    /// 
+    /// The caller must ensure that the entry lives long enough in the
     /// queue or is removed from the queue on drop, caller must guarantee
     /// entry.next is None.
     #[inline(always)]
     pub unsafe fn push(&mut self, entry: NonNull<Signal>) -> bool {
-        if self.last.is_none() {
-            self.first = Some(entry);
-            self.last = Some(entry);
-            true
-        } else {
+        if let Some(mut old) = self.last.take() {
+            // SAFETY: self.last was guaranteed to be valid
             unsafe {
-                // SAFETY: self.last is not null and guaranteed to be valid
-                self.last.unwrap_unchecked().as_mut().next = Some(entry);
+                old.as_mut().next = Some(entry);
             }
             self.last = Some(entry);
             false
+        } else {
+            self.first = Some(entry);
+            self.last = Some(entry);
+            true
         }
     }
 
