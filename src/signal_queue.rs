@@ -22,25 +22,27 @@ impl SignalQueue {
     }
 
     /// Pushes a signal entry into the queue.
-    /// 
+    /// returns true if the queue was previously empty as a hint for spinning.
+    ///
     /// # Safety
-    /// 
+    ///
     /// The caller must ensure that the entry lives long enough in the
     /// queue or is removed from the queue on drop, caller must guarantee
     /// entry.next is None.
     #[inline(always)]
     pub unsafe fn push(&mut self, entry: NonNull<Signal>) -> bool {
-        if let Some(mut old) = self.last.take() {
-            // SAFETY: self.last was guaranteed to be valid
-            unsafe {
-                old.as_mut().next = Some(entry);
+        match self.last.replace(entry) {
+            Some(mut old) => {
+                // SAFETY: self.last was guaranteed to be valid
+                unsafe {
+                    old.as_mut().next = Some(entry);
+                }
+                false
             }
-            self.last = Some(entry);
-            false
-        } else {
-            self.first = Some(entry);
-            self.last = Some(entry);
-            true
+            None => {
+                self.first = Some(entry);
+                true
+            }
         }
     }
 
