@@ -1,4 +1,4 @@
-use crate::QueueStructure;
+use crate::{QueueStructure, backoff::get_parallelism};
 use alloc::boxed::Box;
 use crossbeam_queue::ArrayQueue;
 
@@ -8,14 +8,13 @@ use std::sync::OnceLock;
 #[cfg(not(feature = "std"))]
 use crate::oncelock::OnceLock;
 
-const QUEUE_POOL_CAPACITY: usize = 128;
-
 static QUEUE_ALLOCATOR: OnceLock<ArrayQueue<Box<QueueStructure>>> = OnceLock::new();
 
 fn get_queue_allocator() -> &'static ArrayQueue<Box<QueueStructure>> {
     QUEUE_ALLOCATOR.get_or_init(|| {
-        let queue = ArrayQueue::new(QUEUE_POOL_CAPACITY);
-        for _ in 0..QUEUE_POOL_CAPACITY {
+        let pool_cap = (get_parallelism() * 16).min(128);
+        let queue = ArrayQueue::new(pool_cap);
+        for _ in 0..pool_cap {
             let _ = queue.push(Box::new(QueueStructure::new()));
         }
         queue
