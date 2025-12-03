@@ -1,5 +1,4 @@
 use criterion::{Criterion, criterion_group, criterion_main};
-use monoio::IoUringDriver;
 use std::hint::black_box;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::thread;
@@ -191,9 +190,10 @@ fn benchmark_xutex_contended_tokio_current_thread(c: &mut Criterion) {
     });
 }
 
-fn benchmark_xutex_contended_monoio(c: &mut Criterion) {
-    c.bench_function("xutex_contended_monoio", |b| {
-        let mut runtime = monoio::RuntimeBuilder::<IoUringDriver>::new()
+fn benchmark_xutex_contended_monoio(_c: &mut Criterion) {
+    #[cfg(target_os = "linux")]
+    _c.bench_function("xutex_contended_monoio", |b| {
+        let mut runtime = monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
             .build()
             .unwrap();
         let mutex = Arc::new(AsyncMutex::new(0));
