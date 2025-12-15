@@ -97,7 +97,7 @@ pub(crate) struct MutexInternal<T> {
 }
 
 impl<T> MutexInternal<T> {
-    pub(crate) fn new(data: T) -> Self {
+    pub(crate) const fn new(data: T) -> Self {
         Self {
             inner: UnsafeCell::new(data),
             queue: AtomicPtr::new(UNLOCKED),
@@ -478,7 +478,7 @@ impl<T> Mutex<T> {
     /// let mutex = Mutex::new(42);
     /// ```
     #[inline(always)]
-    pub fn new(data: T) -> Self {
+    pub const fn new(data: T) -> Self {
         Self {
             internal: MutexInternal::new(data),
         }
@@ -940,7 +940,7 @@ impl<T> AsyncMutex<T> {
     /// `MutexInternal` is allocated immediately; no heap allocation is
     /// performed until contention forces a queue to be created.
     #[inline(always)]
-    pub fn new(data: T) -> Self {
+    pub const fn new(data: T) -> Self {
         Self {
             internal: MutexInternal::new(data),
         }
