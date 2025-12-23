@@ -19,8 +19,12 @@ mod allocator;
 mod backoff;
 #[cfg(not(feature = "std"))]
 mod oncelock;
+#[cfg(feature = "reentrant")]
+mod reentrant;
 mod signal_queue;
 mod waker;
+#[cfg(feature = "reentrant")]
+pub use reentrant::{ReentrantMutex, ReentrantMutexGuard};
 pub(crate) use signal_queue::SignalQueue;
 
 use crate::{

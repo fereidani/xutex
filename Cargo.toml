@@ -37,3 +37,4 @@ rpath = false
 [features]
 default = ["std"]
 std = []
+reentrant = ["std"]
