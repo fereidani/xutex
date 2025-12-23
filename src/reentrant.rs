@@ -93,7 +93,8 @@ impl<T> ReentrantMutex<T> {
         self.acquired(thread_id(), guard)
     }
 
-    /// Attempts to acquire without blocking. Returns `None` if held by another thread.
+    /// Attempts to acquire without blocking. Returns `None` if held
+    /// by another thread.
     pub fn try_lock(&self) -> Option<ReentrantMutexGuard<'_, T>> {
         let tid = thread_id();
         if let Some(g) = self.reentrant_guard(tid) {
