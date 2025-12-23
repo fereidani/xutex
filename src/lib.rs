@@ -19,8 +19,12 @@ mod allocator;
 mod backoff;
 #[cfg(not(feature = "std"))]
 mod oncelock;
+#[cfg(feature = "reentrant")]
+mod reentrant;
 mod signal_queue;
 mod waker;
+#[cfg(feature = "reentrant")]
+pub use reentrant::{ReentrantMutex, ReentrantMutexGuard};
 pub(crate) use signal_queue::SignalQueue;
 
 use crate::{
@@ -120,6 +124,13 @@ impl<T> MutexInternal<T> {
     #[inline(always)]
     pub(crate) unsafe fn create_guard(&self) -> MutexGuard<'_, T> {
         MutexGuard { mutex: self }
+    }
+
+    #[cfg(feature = "reentrant")]
+    #[inline(always)]
+    pub(crate) fn has_waiters(&self) -> bool {
+        let ptr = self.queue.load(Ordering::Relaxed);
+        ptr != UNLOCKED && ptr != LOCKED && ptr != UPDATING
     }
 }
 
@@ -782,6 +793,18 @@ impl<T> Mutex<T> {
     #[inline(always)]
     pub fn lock_async(&self) -> AsyncLockRequest<'_, T> {
         self.as_async().lock()
+    }
+
+    #[cfg(feature = "reentrant")]
+    #[inline(always)]
+    unsafe fn force_unlock(&self) {
+        drop(unsafe { self.internal.create_guard() });
+    }
+
+    #[cfg(feature = "reentrant")]
+    #[inline(always)]
+    pub(crate) fn has_waiters(&self) -> bool {
+        self.internal.has_waiters()
     }
 }
 
