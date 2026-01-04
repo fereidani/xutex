@@ -1,6 +1,6 @@
 [package]
 name = "xutex"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 authors = ["Khashayar Fereidani"]
 description = "an extremely fast async mutex with alternative sync API"
@@ -11,7 +11,7 @@ keywords = ["mutex", "thread", "async", "concurrency", "lock"]
 categories = ["concurrency", "asynchronous", "algorithms", "no-std"]
 
 [dependencies]
-branches = "0.3"
+branches = "0.4"
 crossbeam-queue = "0.3"
 
 [dev-dependencies]
