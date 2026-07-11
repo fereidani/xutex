@@ -2,7 +2,7 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::thread;
-use xutex::{AsyncMutex, Mutex};
+use srlion_xutex::{AsyncMutex, Mutex};
 
 const THREAD_COUNT: usize = 64;
 
