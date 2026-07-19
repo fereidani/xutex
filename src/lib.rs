@@ -385,9 +385,15 @@ impl<'a, T> Future for AsyncLockRequest<'a, T> {
 
 impl<'a, T> Drop for AsyncLockRequest<'a, T> {
     fn drop(&mut self) {
-        if unlikely(self.entry.value.load(Ordering::Acquire) == SIGNAL_INIT_WAITING)
-            && !self.remove_from_queue()
-        {
+        let value = self.entry.value.load(Ordering::Acquire);
+        if unlikely(value == SIGNAL_SIGNALED) {
+            // The lock was handed to us but the future was dropped before
+            // observing it: release the lock so it is not leaked.
+            // SAFETY: SIGNAL_SIGNALED means we own the lock.
+            drop(unsafe { self.mutex.create_guard() });
+            return;
+        }
+        if unlikely(value == SIGNAL_INIT_WAITING) && !self.remove_from_queue() {
             // we failed to remove ourself so we need to wait synchronously for the lock,
             // this usually wouldn't take much as other one acquired our pointer and soon
             // will be signaled. the spin is likely to never happen.
