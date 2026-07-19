@@ -1,8 +1,13 @@
-use core::{cell::UnsafeCell, sync::atomic::AtomicBool, task::Waker};
+use core::task::Waker;
 
-#[cfg(feature = "std")]
-use std::thread;
+#[cfg(not(loom))]
+use crate::shim::cell::UnsafeCell;
+#[cfg(not(loom))]
+use crate::shim::sync::atomic::{AtomicBool, Ordering};
+#[cfg(any(feature = "std", loom))]
+use crate::shim::thread;
 
+#[cfg(not(loom))]
 use crate::backoff::Backoff;
 
 pub(crate) enum WakerSlot {
@@ -10,29 +15,33 @@ pub(crate) enum WakerSlot {
     None,
     /// Holds a synchronous thread handle for contexts that wake a thread
     /// directly.
-    #[cfg(feature = "std")]
+    #[cfg(any(feature = "std", loom))]
     Sync(thread::Thread),
     /// Holds an asynchronous `Waker` for futures/tasks.
     Async(Waker),
 }
 
+/// A slot holding the current waker (none, a thread handle, or an async
+/// waker), protected by a tiny spin lock.
+///
+/// The critical sections are a handful of instructions (replace/take the
+/// slot), so a spin lock beats any blocking primitive here. Under loom the
+/// spin lock is modeled as a `loom::sync::Mutex` because loom's scheduler
+/// cannot prove progress through a raw spin loop (this changes nothing about
+/// the protocol being verified: the lock only guards slot access).
+#[cfg(not(loom))]
 pub(crate) struct DynamicWaker {
     /// Spin‑lock flag indicating whether a thread is currently modifying the
     /// slot. `true` means the lock is held; `false` means it is free.
     updating: AtomicBool,
 
-    /// The mutable slot that holds the current waker (none, a thread handle, or
-    /// an async waker). Wrapped in `UnsafeCell` because we manually enforce
-    /// exclusive access via `updating`.
+    /// The mutable slot; manually synchronized via `updating`.
     value: UnsafeCell<WakerSlot>,
 }
 
+#[cfg(not(loom))]
 impl DynamicWaker {
     /// Create a new, empty `DynamicWaker`.
-    ///
-    /// The internal state starts with no stored waker (`WakerSlot::None`) and
-    /// the `updating` flag cleared, meaning no thread is currently modifying
-    /// the slot.
     pub(crate) fn new() -> Self {
         Self {
             updating: AtomicBool::new(false),
@@ -41,10 +50,6 @@ impl DynamicWaker {
     }
 
     /// Create a new `DynamicWaker` that initially holds the current thread.
-    ///
-    /// This variant is used for synchronous contexts where the waker should be
-    /// a `thread::Thread` rather than an async `Waker`. The `updating` flag is
-    /// also cleared initially.
     #[cfg(feature = "std")]
     pub(crate) fn new_sync() -> Self {
         Self {
@@ -55,68 +60,93 @@ impl DynamicWaker {
 
     /// Register (or replace) an async `Waker` in the slot.
     ///
-    /// The method uses a spin‑lock based on `AtomicBool::swap` to obtain
-    /// exclusive access to the `value`. `Backoff` provides an exponential
-    /// pause while waiting, reducing contention on the lock.
-    ///
-    /// * If the slot already contains an `Async` waker, we only replace it when
-    ///   the new waker would actually cause a different wake‑up
+    /// * If the slot already contains an `Async` waker, it is only replaced
+    ///   when the new waker would actually cause a different wake‑up
     ///   (`!val.will_wake(waker)`).
-    /// * If the slot holds any other variant (`None` or `Sync`), we overwrite
-    ///   it with the new async waker.
+    /// * If the slot holds any other variant (`None` or `Sync`), it is
+    ///   overwritten with the new async waker.
     #[inline(always)]
     pub(crate) fn register(&self, waker: &Waker) {
         // Spin until we acquire the lock.
         let backoff = Backoff::new();
-        while self
-            .updating
-            .swap(true, core::sync::atomic::Ordering::Acquire)
-        {
+        while self.updating.swap(true, Ordering::Acquire) {
             backoff.snooze();
         }
 
         // SAFETY: We have exclusive access because `updating` is set to true.
         unsafe {
-            if let WakerSlot::Async(val) = &mut *self.value.get() {
-                // Replace only if the new waker would cause a different wake.
-                if !val.will_wake(waker) {
-                    // The stored waker would not wake the task; replace it.
-                    *val = waker.clone();
+            self.value.with_mut(|slot| {
+                if let WakerSlot::Async(val) = &mut *slot {
+                    // Replace only if the new waker would cause a different
+                    // wake.
+                    if !val.will_wake(waker) {
+                        *val = waker.clone();
+                    }
+                } else {
+                    *slot = WakerSlot::Async(waker.clone());
                 }
-            } else {
-                // Slot is empty or holds a sync thread; store the async waker.
-                *self.value.get() = WakerSlot::Async(waker.clone());
-            }
+            });
         }
 
         // Release the lock.
-        self.updating
-            .store(false, core::sync::atomic::Ordering::Release);
+        self.updating.store(false, Ordering::Release);
     }
 
     /// Take the current `WakerSlot` out of the container, leaving `None`
     /// behind.
-    ///
-    /// This also uses the same spin‑lock pattern as `register` to guarantee
-    /// exclusive access while swapping the value.
     #[inline(always)]
     pub(crate) fn take(&self) -> WakerSlot {
         // Acquire the lock.
         let backoff = Backoff::new();
-        while self
-            .updating
-            .swap(true, core::sync::atomic::Ordering::Acquire)
-        {
+        while self.updating.swap(true, Ordering::Acquire) {
             backoff.snooze();
         }
 
         // SAFETY: We hold the lock, so it's safe to replace the inner value.
-        let value = unsafe { core::mem::replace(&mut *self.value.get(), WakerSlot::None) };
+        let value = unsafe {
+            self.value
+                .with_mut(|slot| core::mem::replace(&mut *slot, WakerSlot::None))
+        };
 
         // Release the lock.
-        self.updating
-            .store(false, core::sync::atomic::Ordering::Release);
+        self.updating.store(false, Ordering::Release);
         value
+    }
+}
+
+/// Loom model of the waker slot: same semantics, loom-aware lock.
+#[cfg(loom)]
+pub(crate) struct DynamicWaker {
+    value: loom::sync::Mutex<WakerSlot>,
+}
+
+#[cfg(loom)]
+impl DynamicWaker {
+    pub(crate) fn new() -> Self {
+        Self {
+            value: loom::sync::Mutex::new(WakerSlot::None),
+        }
+    }
+
+    pub(crate) fn new_sync() -> Self {
+        Self {
+            value: loom::sync::Mutex::new(WakerSlot::Sync(thread::current())),
+        }
+    }
+
+    pub(crate) fn register(&self, waker: &Waker) {
+        let mut slot = self.value.lock().unwrap();
+        if let WakerSlot::Async(val) = &mut *slot {
+            if !val.will_wake(waker) {
+                *val = waker.clone();
+            }
+        } else {
+            *slot = WakerSlot::Async(waker.clone());
+        }
+    }
+
+    pub(crate) fn take(&self) -> WakerSlot {
+        core::mem::replace(&mut *self.value.lock().unwrap(), WakerSlot::None)
     }
 }
 

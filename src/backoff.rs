@@ -1,8 +1,8 @@
 use core::cell::Cell;
-#[cfg(feature = "std")]
+#[cfg(all(feature = "std", not(loom)))]
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-#[cfg(feature = "std")]
+#[cfg(all(feature = "std", not(loom)))]
 use branches::likely;
 
 /// Backoff implements an exponential back‑off strategy used by
@@ -38,12 +38,13 @@ use branches::likely;
 ///   predefined limit, indicating that the caller should give up or take an
 ///   alternative action.
 pub(crate) struct Backoff {
+    #[allow(dead_code)]
     spin: Cell<u32>,
-    #[cfg(feature = "std")]
+    #[cfg(all(feature = "std", not(loom)))]
     snooze_fn: fn(&Self),
 }
 
-#[cfg(not(feature = "std"))]
+#[cfg(all(not(feature = "std"), not(loom)))]
 impl Backoff {
     #[inline(always)]
     pub fn new() -> Self {
@@ -62,7 +63,34 @@ impl Backoff {
     }
 }
 
-#[cfg(feature = "std")]
+#[cfg(loom)]
+impl Backoff {
+    #[inline(always)]
+    pub fn new() -> Self {
+        Self { spin: Cell::new(0) }
+    }
+
+    /// Under loom every snooze is a plain scheduler yield so the model
+    /// checker can explore interleavings without a state-space explosion.
+    /// The iteration guard turns a runaway spin (livelock) into a panic with
+    /// a usable backtrace instead of loom's opaque branch-limit error.
+    #[inline(always)]
+    pub fn snooze(&self) {
+        let spin = self.spin.get();
+        assert!(spin < 2_000, "loom: unbounded spin loop detected");
+        self.spin.set(spin + 1);
+        loom::thread::yield_now();
+    }
+
+    /// Under loom the pre-park spin phase is skipped entirely to keep the
+    /// explored state space small.
+    #[inline(always)]
+    pub fn is_completed(&self) -> bool {
+        true
+    }
+}
+
+#[cfg(all(feature = "std", not(loom)))]
 impl Backoff {
     #[inline(always)]
     pub fn new() -> Self {
@@ -119,7 +147,7 @@ impl Backoff {
 /// hot paths (e.g. spin‑backoff) where the overhead of a function call would
 /// be noticeable.
 #[inline(always)]
-#[cfg(feature = "std")]
+#[cfg(all(feature = "std", not(loom)))]
 pub fn get_parallelism() -> usize {
     static PARALLELISM: AtomicUsize = AtomicUsize::new(0);
 
@@ -136,7 +164,15 @@ pub fn get_parallelism() -> usize {
     parallelism
 }
 
-#[cfg(not(feature = "std"))]
+#[cfg(all(not(feature = "std"), not(loom)))]
 pub fn get_parallelism() -> usize {
     1
+}
+
+/// Fixed parallelism under loom: the pool allocator is bypassed and the
+/// backoff never consults this, but keep the symbol available.
+#[cfg(loom)]
+#[allow(dead_code)]
+pub fn get_parallelism() -> usize {
+    2
 }

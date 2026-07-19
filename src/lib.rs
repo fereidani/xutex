@@ -8,10 +8,8 @@ use alloc::boxed::Box;
 use alloc::sync::Arc;
 use core::ptr::NonNull;
 use core::{
-    cell::UnsafeCell,
     marker::PhantomPinned,
     ops::{Deref, DerefMut},
-    sync::atomic::{AtomicPtr, AtomicUsize, Ordering},
     task::Poll,
 };
 
@@ -19,9 +17,17 @@ mod allocator;
 mod backoff;
 #[cfg(not(feature = "std"))]
 mod oncelock;
+mod shim;
 mod signal_queue;
 mod waker;
 pub(crate) use signal_queue::SignalQueue;
+
+
+
+use crate::shim::cell::UnsafeCell;
+use crate::shim::const_fn;
+use crate::shim::spin::{SpinAtomicPtr, SpinAtomicUsize};
+use crate::shim::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::{
     allocator::{allocate_queue, deallocate_queue},
@@ -32,9 +38,15 @@ use branches::{likely, unlikely};
 
 #[repr(C)]
 pub(crate) struct Signal {
-    next: Option<NonNull<Signal>>,
-    value: AtomicUsize,
-    waker: DynamicWaker,
+    pub(crate) next: Option<NonNull<Signal>>,
+    pub(crate) value: SpinAtomicUsize,
+    pub(crate) waker: DynamicWaker,
+    /// Auxiliary per-waiter word used by the higher-level primitives:
+    /// the semaphore stores the number of permits still missing, the
+    /// barrier and notify primitives store the waiter's generation.
+    /// The mutex does not use it. It is only accessed while holding the
+    /// queue tag-lock or after the final signal handoff.
+    pub(crate) aux: AtomicUsize,
     _pinned: PhantomPinned,
 }
 
@@ -42,40 +54,51 @@ impl Signal {
     pub fn new_none() -> Self {
         Self {
             next: None,
-            value: AtomicUsize::new(SIGNAL_UNINIT),
+            value: SpinAtomicUsize::new(SIGNAL_UNINIT),
             waker: DynamicWaker::new(),
+            aux: AtomicUsize::new(0),
             _pinned: PhantomPinned,
         }
     }
-    #[cfg(feature = "std")]
+    #[cfg(any(feature = "std", loom))]
     pub fn new_sync() -> Self {
         Self {
             next: None,
-            value: AtomicUsize::new(SIGNAL_UNINIT),
+            value: SpinAtomicUsize::new(SIGNAL_UNINIT),
             waker: DynamicWaker::new_sync(),
+            aux: AtomicUsize::new(0),
             _pinned: PhantomPinned,
         }
     }
+
+    /// Resets the node so it can be pushed to a wait queue again after
+    /// having been popped and signaled (once-cell retry handoff).
+    pub(crate) fn reset(&mut self) {
+        self.next = None;
+        self.value.store(SIGNAL_UNINIT, Ordering::Relaxed);
+    }
 }
 
-struct QueueStructure {
+pub(crate) struct QueueStructure {
     pub inner: UnsafeCell<SignalQueue>,
 }
 
 impl QueueStructure {
-    const fn new() -> Self {
-        Self {
-            inner: UnsafeCell::new(SignalQueue::new()),
+    const_fn! {
+        pub(crate) const fn new() -> Self {
+            Self {
+                inner: UnsafeCell::new(SignalQueue::new()),
+            }
         }
     }
 }
 
 const LOCKED: *mut QueueStructure = usize::MAX as *mut _;
 const UNLOCKED: *mut QueueStructure = core::ptr::null_mut();
-const UPDATING: *mut QueueStructure = LOCKED.wrapping_sub(1);
+pub(crate) const UPDATING: *mut QueueStructure = LOCKED.wrapping_sub(1);
 
 #[inline(always)]
-fn tag_pointer<T>(ptr: *mut T) -> *mut T {
+pub(crate) fn tag_pointer<T>(ptr: *mut T) -> *mut T {
     debug_assert!(
         (ptr.addr() & 1) == 0,
         "Tagging pointer failed due to target memory alignment"
@@ -84,7 +107,7 @@ fn tag_pointer<T>(ptr: *mut T) -> *mut T {
 }
 
 #[inline(always)]
-fn untag_pointer<T>(ptr: *mut T) -> (*mut T, bool) {
+pub(crate) fn untag_pointer<T>(ptr: *mut T) -> (*mut T, bool) {
     let is_tagged = (ptr.addr() & 1) == 1;
     let untagged = ptr.map_addr(|addr| addr & !1).cast::<T>();
     (untagged, is_tagged)
@@ -92,15 +115,17 @@ fn untag_pointer<T>(ptr: *mut T) -> (*mut T, bool) {
 
 #[repr(C)]
 pub(crate) struct MutexInternal<T> {
-    queue: AtomicPtr<QueueStructure>,
+    queue: SpinAtomicPtr<QueueStructure>,
     inner: UnsafeCell<T>,
 }
 
 impl<T> MutexInternal<T> {
-    pub(crate) const fn new(data: T) -> Self {
-        Self {
-            inner: UnsafeCell::new(data),
-            queue: AtomicPtr::new(UNLOCKED),
+    const_fn! {
+        pub(crate) const fn new(data: T) -> Self {
+            Self {
+                inner: UnsafeCell::new(data),
+                queue: SpinAtomicPtr::new(UNLOCKED),
+            }
         }
     }
 
@@ -135,12 +160,12 @@ impl<T> MutexInternal<T> {
 ///
 /// This type contains [`PhantomPinned`] and is `!Unpin`, meaning it cannot be
 /// moved once pinned. This is necessary because the struct contains a
-/// [`Signal`] that may be linked into the mutex's wait queue, and moving it
+/// `Signal` that may be linked into the mutex's wait queue, and moving it
 /// would invalidate the queue pointers.
 ///
 /// ## Memory Safety
 ///
-/// The struct maintains a reference to the mutex and embeds a [`Signal`] entry
+/// The struct maintains a reference to the mutex and embeds a `Signal` entry
 /// that may be inserted into the mutex's internal wait queue. If the future is
 /// dropped while waiting, it will automatically remove itself from the queue
 /// or wait synchronously for the lock to avoid use-after-free issues.
@@ -187,10 +212,19 @@ pub struct AsyncLockRequest<'a, T> {
     _pinned: PhantomPinned,
 }
 
-const SIGNAL_UNINIT: usize = 0;
-const SIGNAL_INIT_WAITING: usize = 1;
-const SIGNAL_SIGNALED: usize = 2;
-const SIGNAL_RETURNED: usize = !0;
+pub(crate) const SIGNAL_UNINIT: usize = 0;
+pub(crate) const SIGNAL_INIT_WAITING: usize = 1;
+/// The waited-for event happened: the lock/permits were handed to the waiter
+/// (mutex, semaphore) or the notification fired (notify/barrier/once-cell).
+pub(crate) const SIGNAL_SIGNALED: usize = 2;
+/// The primitive was closed while the waiter was queued (semaphore only).
+pub(crate) const SIGNAL_CLOSED: usize = 3;
+/// Woken by a broadcast (`notify_waiters`); needs no re-delivery on drop.
+pub(crate) const SIGNAL_ALL: usize = 4;
+/// The once-cell initializer was cancelled; the woken waiter should retry
+/// becoming the initializer itself.
+pub(crate) const SIGNAL_RETRY: usize = 5;
+pub(crate) const SIGNAL_RETURNED: usize = !0;
 
 impl<'a, T> AsyncLockRequest<'a, T> {
     #[cold]
@@ -229,9 +263,9 @@ impl<'a, T> AsyncLockRequest<'a, T> {
             // Remove ourselves from the queue
             let result = unsafe {
                 // SAFETY: ptr is tagged and we have exclusive access
-                let queue = (&mut *ptr).inner.get_mut();
-
-                queue.remove(NonNull::new_unchecked(&mut self.entry))
+                (*ptr)
+                    .inner
+                    .with_mut(|queue| (*queue).remove(NonNull::new_unchecked(&mut self.entry)))
             };
             // Untag the queue we have guard
             self.mutex.queue.store(ptr, Ordering::Release);
@@ -332,16 +366,13 @@ impl<'a, T> Future for AsyncLockRequest<'a, T> {
                     }
                 }
 
-                let queue = unsafe {
-                    // SAFETY: ptr is tagged and we have exclusive access
-                    (&mut *ptr).inner.get_mut()
-                };
-
                 unsafe {
-                    // SAFETY: We guarantee that the entry lives long enough, or is removed from the
-                    // queue on drop
-                    // Convert the mutable raw pointer to NonNull as required by `push`
-                    queue.push(NonNull::new_unchecked(&mut this.entry));
+                    // SAFETY: ptr is tagged and we have exclusive access to the
+                    // queue. We guarantee that the entry lives long enough, or
+                    // is removed from the queue on drop.
+                    (*ptr)
+                        .inner
+                        .with_mut(|queue| (*queue).push(NonNull::new_unchecked(&mut this.entry)));
                 }
 
                 this.mutex.queue.store(ptr, Ordering::Release);
@@ -478,7 +509,16 @@ impl<T> Mutex<T> {
     /// let mutex = Mutex::new(42);
     /// ```
     #[inline(always)]
+    #[cfg(not(loom))]
     pub const fn new(data: T) -> Self {
+        Self {
+            internal: MutexInternal::new(data),
+        }
+    }
+
+    /// Creates a new synchronous mutex (loom model-checking build).
+    #[cfg(loom)]
+    pub fn new(data: T) -> Self {
         Self {
             internal: MutexInternal::new(data),
         }
@@ -548,15 +588,13 @@ impl<T> Mutex<T> {
                 }
             }
 
-            let queue = unsafe {
-                // SAFETY: ptr is tagged and we have exclusive access
-                (&mut *ptr).inner.get_mut()
-            };
-
             let do_spin = unsafe {
-                // SAFETY: We guarantee that the entry lives long enough by blocking here
-                // Convert the mutable raw pointer to `NonNull<Signal>` as required by `push`.
-                queue.push(NonNull::new_unchecked(&mut entry))
+                // SAFETY: ptr is tagged and we have exclusive access to the
+                // queue. We guarantee that the entry lives long enough by
+                // blocking here.
+                (*ptr)
+                    .inner
+                    .with_mut(|queue| (*queue).push(NonNull::new_unchecked(&mut entry)))
             };
 
             mutex.queue.store(ptr, Ordering::Release);
@@ -575,7 +613,7 @@ impl<T> Mutex<T> {
                 return;
             }
             loop {
-                std::thread::park();
+                crate::shim::thread::park();
                 if entry.value.load(Ordering::Acquire) == SIGNAL_SIGNALED {
                     return;
                 }
@@ -940,7 +978,16 @@ impl<T> AsyncMutex<T> {
     /// `MutexInternal` is allocated immediately; no heap allocation is
     /// performed until contention forces a queue to be created.
     #[inline(always)]
+    #[cfg(not(loom))]
     pub const fn new(data: T) -> Self {
+        Self {
+            internal: MutexInternal::new(data),
+        }
+    }
+
+    /// Creates a new asynchronous mutex (loom model-checking build).
+    #[cfg(loom)]
+    pub fn new(data: T) -> Self {
         Self {
             internal: MutexInternal::new(data),
         }
@@ -1166,14 +1213,12 @@ impl<'a, T> MutexGuard<'a, T> {
             backoff.snooze();
         }
 
-        let queue = unsafe {
+        let popped = unsafe {
             // SAFETY: ptr is tagged and we have exclusive access
-            &mut *ptr
-        }
-        .inner
-        .get_mut();
+            (*ptr).inner.with_mut(|queue| (*queue).pop())
+        };
 
-        if let Some(entry) = queue.pop() {
+        if let Some(entry) = popped {
             // untag pointer
             self.mutex.queue.store(ptr, Ordering::Release);
             unsafe {
@@ -1216,7 +1261,8 @@ impl<T> Deref for MutexGuard<'_, T> {
 
     #[inline(always)]
     fn deref(&self) -> &Self::Target {
-        unsafe { &*self.mutex.inner.get() }
+        // SAFETY: the guard proves exclusive ownership of the lock
+        unsafe { self.mutex.inner.with(|ptr| &*ptr) }
     }
 }
 
@@ -1239,7 +1285,8 @@ impl<T> Drop for MutexGuard<'_, T> {
 impl<T> DerefMut for MutexGuard<'_, T> {
     #[inline(always)]
     fn deref_mut(&mut self) -> &mut Self::Target {
-        unsafe { &mut *self.mutex.inner.get() }
+        // SAFETY: the guard proves exclusive ownership of the lock
+        unsafe { self.mutex.inner.with_mut(|ptr| &mut *ptr) }
     }
 }
 
