@@ -23,11 +23,13 @@ pub(crate) use signal_queue::SignalQueue;
 
 mod barrier;
 mod notify;
+mod once_cell;
 mod rwlock;
 mod semaphore;
 mod wait_queue;
 pub use barrier::{AsyncBarrier, AsyncBarrierWaitRequest, BarrierWaitResult};
 pub use notify::{AsyncNotified, AsyncNotify};
+pub use once_cell::{AsyncGetOrInit, AsyncGetOrTryInit, AsyncOnceCell, SetError};
 pub use rwlock::{
     AsyncReadRequest, AsyncRwLock, AsyncWriteRequest, RwLockReadGuard, RwLockWriteGuard,
 };
@@ -39,6 +41,8 @@ pub use semaphore::{
 pub use barrier::Barrier;
 #[cfg(feature = "std")]
 pub use notify::Notify;
+#[cfg(feature = "std")]
+pub use once_cell::OnceCell;
 #[cfg(feature = "std")]
 pub use rwlock::RwLock;
 #[cfg(feature = "std")]
