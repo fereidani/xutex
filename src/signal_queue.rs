@@ -46,6 +46,18 @@ impl SignalQueue {
         }
     }
 
+    /// Returns the entry at the front of the queue without removing it.
+    #[inline(always)]
+    pub fn first(&self) -> Option<NonNull<Signal>> {
+        self.first
+    }
+
+    /// Returns `true` when no entry is queued.
+    #[inline(always)]
+    pub fn is_empty(&self) -> bool {
+        self.first.is_none()
+    }
+
     /// Pops a signal entry from the front of the queue.
     #[inline(always)]
     pub fn pop(&mut self) -> Option<NonNull<Signal>> {

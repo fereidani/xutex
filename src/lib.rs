@@ -3,7 +3,6 @@
 #![doc = include_str!("../README.md")]
 
 extern crate alloc;
-use alloc::boxed::Box;
 #[cfg(feature = "std")]
 use alloc::sync::Arc;
 use core::ptr::NonNull;
@@ -22,6 +21,7 @@ mod signal_queue;
 mod waker;
 pub(crate) use signal_queue::SignalQueue;
 
+mod wait_queue;
 
 
 use crate::shim::cell::UnsafeCell;
@@ -342,7 +342,7 @@ impl<'a, T> Future for AsyncLockRequest<'a, T> {
                         continue;
                     }
 
-                    ptr = Box::leak(allocate_queue());
+                    ptr = allocate_queue();
                 } else {
                     let is_tagged;
                     (ptr, is_tagged) = untag_pointer(ptr);
@@ -563,7 +563,7 @@ impl<T> Mutex<T> {
                     continue;
                 }
 
-                ptr = Box::leak(allocate_queue());
+                ptr = allocate_queue();
             } else {
                 let is_tagged;
                 (ptr, is_tagged) = untag_pointer(ptr);
@@ -1247,11 +1247,9 @@ impl<'a, T> MutexGuard<'a, T> {
         } else {
             // queue is untouched it is possible to release the queue and unlock
             self.mutex.queue.store(UNLOCKED, Ordering::Release);
-            // SAFETY: this section is sole owner of the queue and queue is_empty
-            unsafe {
-                // no clean up needed as when is_empty is met, both first and last are None
-                deallocate_queue(Box::from_raw(ptr));
-            }
+            // This section is the sole owner of the queue and the queue is
+            // empty (no clean up needed: both first and last are None).
+            deallocate_queue(ptr);
         }
     }
 }
