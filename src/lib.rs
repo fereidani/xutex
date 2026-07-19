@@ -21,8 +21,14 @@ mod signal_queue;
 mod waker;
 pub(crate) use signal_queue::SignalQueue;
 
+mod semaphore;
 mod wait_queue;
+pub use semaphore::{
+    AcquireError, AsyncAcquireRequest, AsyncSemaphore, SemaphorePermit, TryAcquireError,
+};
 
+#[cfg(feature = "std")]
+pub use semaphore::Semaphore;
 
 use crate::shim::cell::UnsafeCell;
 use crate::shim::const_fn;
