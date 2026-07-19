@@ -233,7 +233,7 @@ impl<'a, T> AsyncLockRequest<'a, T> {
         // Find and remove ourselves from the queue
         let backoff = Backoff::new();
         loop {
-            let ptr = self.mutex.queue.load(Ordering::Acquire);
+            let ptr = wait_queue::spin_reload(&self.mutex.queue);
             if ptr == UNLOCKED || ptr == LOCKED {
                 // Queue was deallocated or mutex is just locked, we're not in any queue
                 return false;
@@ -362,6 +362,7 @@ impl<'a, T> Future for AsyncLockRequest<'a, T> {
                     );
 
                     if unlikely(tagging_result.is_err()) {
+                        backoff.snooze();
                         continue;
                     }
                 }
@@ -1196,27 +1197,37 @@ impl<'a, T> MutexGuard<'a, T> {
             return;
         }
         let mut ptr = unlock_result.unwrap_err();
-        while ptr == UPDATING {
-            backoff.snooze();
-            ptr = self.mutex.queue.load(Ordering::Acquire);
-        }
-
-        (ptr, _) = untag_pointer(ptr);
-
-        // tag pointer
-        let tagged_ptr = tag_pointer(ptr);
-
         loop {
-            let tagging_result = self.mutex.queue.compare_exchange(
-                ptr,
-                tagged_ptr,
+            // A stale value (the failed-unlock error or a racing snapshot)
+            // can show transient states; re-read until the queue pointer is
+            // stable and the tag is ours. While we hold the lock the queue
+            // address itself cannot change, so this terminates.
+            if ptr == UPDATING || ptr == LOCKED {
+                backoff.snooze();
+                ptr = wait_queue::spin_reload(&self.mutex.queue);
+                continue;
+            }
+            let (untagged, is_tagged) = untag_pointer(ptr);
+            if unlikely(is_tagged) {
+                backoff.snooze();
+                ptr = wait_queue::spin_reload(&self.mutex.queue);
+                continue;
+            }
+            match self.mutex.queue.compare_exchange(
+                untagged,
+                tag_pointer(untagged),
                 Ordering::Acquire,
                 Ordering::Relaxed,
-            );
-            if likely(tagging_result.is_ok()) {
-                break;
+            ) {
+                Ok(_) => {
+                    ptr = untagged;
+                    break;
+                }
+                Err(actual) => {
+                    backoff.snooze();
+                    ptr = actual;
+                }
             }
-            backoff.snooze();
         }
 
         let popped = unsafe {
