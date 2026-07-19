@@ -1,22 +1,26 @@
-# Xutex — High‑Performance Hybrid Mutex
+# Xutex — High‑Performance Hybrid Synchronization Primitives
 
 [![Crates.io](https://img.shields.io/crates/v/xutex.svg)](https://crates.io/crates/xutex)
 [![Documentation](https://docs.rs/xutex/badge.svg)](https://docs.rs/xutex)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-**Xutex** is a high-performance mutex that seamlessly bridges synchronous and asynchronous Rust code with a single type and unified internal representation. Designed for **extremely low-latency lock acquisition** under minimal contention, it achieves near-zero overhead on the fast path while remaining runtime-agnostic.
+**Xutex** is a family of high-performance synchronization primitives — `Mutex`, `RwLock`, `Semaphore`, `Notify`, `Barrier` and `OnceCell` — that seamlessly bridge synchronous and asynchronous Rust code with paired types sharing a unified internal representation. Designed for **extremely low-latency acquisition** under minimal contention, they achieve near-zero overhead on the fast path while remaining runtime-agnostic.
 
 ## Key Features
 
-- **⚡ Blazing-fast async performance**: Up to 50× faster than standard sync mutexes in single-threaded async runtimes, and 3–5× faster in multi-threaded async runtime under extreme contention.
-- **🔄 Hybrid API**: Use the same lock in both sync and async contexts
-- **⚡ 8-byte lock state**: Single `AtomicPtr` on 64-bit platforms (guarded data stored separately)
-- **🚀 Zero-allocation fast path**: Lock acquisition requires no heap allocation when uncontended
-- **♻️ Smart allocation reuse**: Object pooling minimizes allocations under contention
+- **⚡ Blazing-fast async performance**: Up to 50× faster than standard sync mutexes in single-threaded async runtimes, and 2–6× faster than `tokio::sync` primitives under contention on multi-threaded runtimes.
+- **🧰 Complete primitive family**: `Mutex`, `RwLock`, `Semaphore`, `Notify`, `Barrier` and `OnceCell` — every one available in a sync and an async flavor sharing the same algorithm
+- **🔄 Hybrid API**: Every primitive comes as a layout-identical `X`/`AsyncX` pair with zero-cost conversions (`as_async()`, `to_sync()`, `Arc` casts), so the same object serves blocking threads and async tasks
+- **⚡ 8-byte lock state**: Single `AtomicPtr` mutex state on 64-bit platforms (guarded data stored separately)
+- **🚀 Zero-allocation fast path**: Acquisition requires no heap allocation when uncontended; waiters are stack-allocated intrusive nodes, so even contended waits allocate nothing per waiter
+- **♻️ Smart allocation reuse**: The only heap object — the wait queue itself — is pooled and exists only while waiters are parked
 - **🎯 Runtime-agnostic**: Works with Tokio, async-std, monoio, or any executor using `std::task::Waker`
 - **🔒 Lock-free fast path**: Single CAS operation for uncontended acquisition
+- **⚖️ Fair by construction**: Semaphore and RwLock are strict-FIFO (write-preferring RwLock, like tokio); no starvation
+- **🛑 Cancellation-safe futures**: Dropping any pending acquisition future cleanly unregisters it (and returns already-granted permits); barrier waits even withdraw their arrival
+- **🧪 Model-checked & UB-checked**: Exhaustively tested with [loom](https://github.com/tokio-rs/loom) and [miri](https://github.com/rust-lang/miri)
 - **📦 Minimal footprint**: Compact state representation with lazy queue allocation
-- **🛡️ No-std compatible**: Fully compatible with `no_std` environments, relying only on `core` and `alloc`
+- **🛡️ No-std compatible**: The async primitives are fully `no_std` (only `core` + `alloc`)
 
 ## Installation
 
@@ -91,6 +95,58 @@ fn example(){
 }
 ```
 
+### The Whole Family
+
+Every primitive follows the same split: a synchronous type (`RwLock`, `Semaphore`, `Notify`, `Barrier`, `OnceCell`) and a layout-identical asynchronous twin (`AsyncRwLock`, `AsyncSemaphore`, `AsyncNotify`, `AsyncBarrier`, `AsyncOnceCell`), freely convertible in both directions:
+
+```rust
+#[cfg(feature = "std")]
+fn example() {
+  use xutex::{RwLock, Semaphore, Notify, Barrier, OnceCell};
+
+  // Reader-writer lock: many readers or one writer, write-preferring FIFO.
+  let lock = RwLock::new(0);
+  {
+      let r1 = lock.read();
+      let r2 = lock.read();
+      assert_eq!(*r1 + *r2, 0);
+  }
+  *lock.write() += 1;
+
+  // Counting semaphore with atomic multi-permit acquisition.
+  let sem = Semaphore::new(4);
+  let permit = sem.acquire_many(2).unwrap();
+  assert_eq!(sem.available_permits(), 2);
+  drop(permit);
+
+  // Notification: store-one-permit or wake-all.
+  let notify = Notify::new();
+  notify.notify_one();
+  notify.wait(); // consumes the stored permit without blocking
+
+  // Reusable barrier.
+  let barrier = Barrier::new(1);
+  assert!(barrier.wait().is_leader());
+
+  // Initialize-once cell with waiter takeover on failure.
+  let cell = OnceCell::new();
+  assert_eq!(*cell.get_or_init(|| 42), 42);
+}
+```
+
+```rust
+use xutex::{AsyncRwLock, AsyncSemaphore};
+
+async fn example(lock: &AsyncRwLock<i32>, sem: &AsyncSemaphore) {
+    let value = *lock.read().await;
+    let _permit = sem.acquire().await.unwrap();
+    let mut w = lock.write().await;
+    *w += value;
+    // Dropping any pending future (e.g. inside tokio::select!) is safe:
+    // it unregisters from the wait queue and returns any granted permits.
+}
+```
+
 ## Performance Characteristics
 
 ### Why It's Fast
@@ -129,6 +185,17 @@ cargo bench
 - **Uncontended**: ~1-3ns per lock/unlock cycle (single CAS operation)
 - **High contention**: 2-3× faster than `tokio::sync::Mutex` in async contexts
 - **Sync contexts**: Performance comparable to `std::sync::Mutex` with minimal overhead from queue pointer checks under high contention; matches `parking_lot` performance in low-contention scenarios
+
+Sample results for the newer primitives (Linux x86-64, 16 logical cores; `cargo bench`):
+
+| Benchmark                                            |   xutex |     tokio |    std | parking_lot |
+| ---------------------------------------------------- | ------: | --------: | -----: | ----------: |
+| `RwLock` read, uncontended                           |  6.4 ns |   28.9 ns | 5.7 ns |      6.3 ns |
+| `RwLock` write, uncontended                          |  6.6 ns |         — | 5.7 ns |      5.6 ns |
+| `RwLock` contended, tokio rt (64 tasks, 7:1 r/w)     |  449 µs |    872 µs |      — |           — |
+| `Semaphore` acquire/release, uncontended             |  6.3 ns |   28.3 ns |      — |           — |
+| `Semaphore` contended, tokio rt (64 tasks, 4 permits) |  277 µs |   1.67 ms |      — |           — |
+| `Notify` permit round-trip                           |  9.3 ns |   12.9 ns |      — |           — |
 
 ## Design Deep Dive
 
@@ -211,6 +278,44 @@ Each waiter tracks its state through atomic transitions:
 
 Implements `Deref<Target = T>` and `DerefMut` for transparent access to the protected data. Automatically releases the lock on drop.
 
+### `RwLock<T>` / `AsyncRwLock<T>`
+
+| Method                             | Description                                          |
+| ---------------------------------- | ---------------------------------------------------- |
+| `new(data)` / `with_max_readers`   | Create (default max readers: `u32::MAX >> 3`)        |
+| `read()` / `write()`               | Acquire shared/exclusive access (blocking or future) |
+| `try_read()` / `try_write()`       | Non-blocking attempts                                |
+| `read_async()` … / `read_sync()` … | Cross-mode acquisition                               |
+| `RwLockWriteGuard::downgrade()`    | Atomically demote a write guard to a read guard      |
+| `get_mut()` / `into_inner()`       | Direct access through exclusive ownership            |
+
+Fair and write-preferring (strict FIFO, tokio-style): queued writers block later readers, so writers cannot starve.
+
+### `Semaphore` / `AsyncSemaphore`
+
+| Method                                | Description                                    |
+| ------------------------------------- | ---------------------------------------------- |
+| `new(permits)`                        | Create with an initial permit count            |
+| `acquire()` / `acquire_many(n)`       | Acquire permits (blocking or future), FIFO     |
+| `try_acquire()` / `try_acquire_many`  | Non-blocking attempts                          |
+| `add_permits(n)` / `forget_permits`   | Grow / shrink the pool                         |
+| `close()` / `is_closed()`             | Fail all current and future acquisitions       |
+| `SemaphorePermit::{forget,split,merge}` | Permit manipulation                          |
+
+`acquire_many` hands over all `n` permits atomically; a partially served waiter blocks later waiters (fairness), and cancellation returns partially assigned permits.
+
+### `Notify` / `AsyncNotify`
+
+`notify_one()` (wakes one waiter or stores a single permit), `notify_waiters()` (wakes all current waiters; also completes every `notified()` future created before the call), `wait()`/`notified()`. A `notify_one` wakeup consumed by a dropped future is passed on to the next waiter, matching tokio semantics.
+
+### `Barrier` / `AsyncBarrier`
+
+`new(n)`, `wait()` → `BarrierWaitResult::is_leader()`. Reusable across rounds. Unlike `tokio::sync::Barrier`, dropping a pending wait future *withdraws* the arrival, so cancellation cannot deadlock the barrier.
+
+### `OnceCell<T>` / `AsyncOnceCell<T>`
+
+`get`, `set`, `get_or_init`, `get_or_try_init`, `initialized`, `get_mut`, `take`, `into_inner`. Concurrent initializers race; losers park allocation-free. A failed, panicking, or cancelled initializer hands the role to a queued waiter (which runs its own closure), matching tokio semantics.
+
 ## Use Cases
 
 ### ✅ Ideal For
@@ -223,8 +328,7 @@ Implements `Deref<Target = T>` and `DerefMut` for transparent access to the prot
 
 ### ⚠️ Not Ideal For
 
-- **Predominantly synchronous workloads**: In pure sync environments without async interaction, `std::sync::Mutex` may offer slightly better performance due to lower abstraction overhead
-- **Read-heavy workloads**: If your use case involves frequent reads with infrequent writes, consider using `RwLock` implementations (e.g., `std::sync::RwLock` or `tokio::sync::RwLock`) that allow multiple concurrent readers
+- **Predominantly synchronous workloads**: In pure sync environments without async interaction, `std::sync` primitives may offer slightly better performance due to lower abstraction overhead
 - **Mutex poison state**: Cases where `std::sync::Mutex` poisoning semantics are required
 
 ## Caveats
@@ -244,13 +348,28 @@ cargo test
 # With Miri (undefined behavior detection)
 cargo +nightly miri test
 
+# With loom (exhaustive concurrency model checking)
+RUSTFLAGS="--cfg loom" cargo test --release --test loom
+
 # Benchmarks
 cargo bench
 ```
 
+The loom suite explores every thread interleaving (including weak-memory
+reorderings) of small scenarios for each primitive: lock handoff, permit
+handoff and partial `acquire_many` assignment, close/cancel races, lost-wakeup
+races in `Notify`, barrier rounds and once-cell initializer races. Under
+loom, the internal wait-queue spinlock and waker slot are modeled with
+loom-aware locks (loom cannot prove progress through raw spin loops); the
+spinlock mechanics themselves are covered by miri and the native stress
+tests.
+
 ## TODO
 
-- [ ] Implement `RwLock` variant with shared/exclusive locking
+- [x] Implement `RwLock` variant with shared/exclusive locking
+- [x] `Semaphore`, `Notify`, `Barrier` and `OnceCell` primitives
+- [x] Loom-based exhaustive concurrency testing
+- [ ] Owned (`Arc`-based) guard variants (`OwnedSemaphorePermit`, …)
 - [ ] Explore lock-free linked list implementation for improved wait queue performance
 
 ## Contributing
