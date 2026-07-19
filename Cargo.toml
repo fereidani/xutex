@@ -37,3 +37,9 @@ rpath = false
 [features]
 default = ["std"]
 std = []
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+
+[target."cfg(loom)".dependencies]
+loom = { version = "0.7", features = ["futures"] }
