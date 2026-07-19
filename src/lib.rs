@@ -21,10 +21,12 @@ mod signal_queue;
 mod waker;
 pub(crate) use signal_queue::SignalQueue;
 
+mod barrier;
 mod notify;
 mod rwlock;
 mod semaphore;
 mod wait_queue;
+pub use barrier::{AsyncBarrier, AsyncBarrierWaitRequest, BarrierWaitResult};
 pub use notify::{AsyncNotified, AsyncNotify};
 pub use rwlock::{
     AsyncReadRequest, AsyncRwLock, AsyncWriteRequest, RwLockReadGuard, RwLockWriteGuard,
@@ -33,6 +35,8 @@ pub use semaphore::{
     AcquireError, AsyncAcquireRequest, AsyncSemaphore, SemaphorePermit, TryAcquireError,
 };
 
+#[cfg(feature = "std")]
+pub use barrier::Barrier;
 #[cfg(feature = "std")]
 pub use notify::Notify;
 #[cfg(feature = "std")]
