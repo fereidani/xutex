@@ -24,7 +24,7 @@ use crate::backoff::Backoff;
 use crate::shim::cell::UnsafeCell;
 use crate::shim::const_fn;
 use crate::shim::sync::atomic::{AtomicUsize, Ordering};
-use crate::wait_queue::{PoppedChain, WaitQueue, signal_node};
+use crate::wait_queue::{PoppedChain, WaitQueue, rearm, signal_node};
 use crate::{
     SIGNAL_INIT_WAITING, SIGNAL_RETRY, SIGNAL_RETURNED, SIGNAL_SIGNALED, SIGNAL_UNINIT, Signal,
 };
@@ -755,8 +755,14 @@ where
                     self.entry.reset();
                 }
                 SIGNAL_INIT_WAITING => {
-                    self.entry.waker.register(cx.waker());
-                    return Poll::Pending;
+                    // Queued: re-arm the waker, or learn that the signal is
+                    // already in flight and re-read it.
+                    // SAFETY: the entry is pinned inside this future and
+                    // alive.
+                    match unsafe { rearm(NonNull::new_unchecked(&raw mut self.entry), cx) } {
+                        Poll::Pending => return Poll::Pending,
+                        Poll::Ready(_) => continue,
+                    }
                 }
                 SIGNAL_RETURNED => unreachable!("get_or_init polled after completion"),
                 _ => debug_assert_eq!(sig_val, SIGNAL_UNINIT),

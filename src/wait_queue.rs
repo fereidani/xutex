@@ -21,6 +21,7 @@
 //! counter, …) and use the queue only to park waiters.
 
 use core::ptr::NonNull;
+use core::task::{Context, Poll};
 
 use branches::unlikely;
 
@@ -34,8 +35,8 @@ use crate::backoff::Backoff;
 use crate::shim::const_fn;
 use crate::shim::spin::SpinAtomicPtr;
 use crate::shim::sync::atomic::Ordering;
-use crate::waker::WakerSlot;
-use crate::{QueueStructure, Signal, SignalQueue};
+use crate::waker::{Registered, WakerSlot};
+use crate::{QueueStructure, SIGNAL_SIGNALED, Signal, SignalQueue};
 #[cfg(not(loom))]
 use crate::{UPDATING, tag_pointer, untag_pointer};
 
@@ -356,4 +357,37 @@ pub(crate) unsafe fn signal_node(node: NonNull<Signal>, value: usize) {
             waker.wake();
         }
     }
+}
+
+/// Re-registers the waker of an entry that is still `SIGNAL_INIT_WAITING`
+/// (a re-poll of a queued future).
+///
+/// A signaler takes the waker *before* publishing the value (see
+/// [`signal_node`]), so the node may be released the moment the value is
+/// visible. If the slot turns out to be empty here, that take has already
+/// happened: the signal is in flight for the *previous* waker and would
+/// never reach the one just stored. The value is then re-read; if it already
+/// landed it is returned so the caller consumes the signal right away,
+/// otherwise the task wakes itself so it polls again once the value is
+/// published.
+///
+/// Returns `Poll::Pending` when the caller should return pending.
+///
+/// # Safety
+///
+/// `node` must point to a live entry owned by the polling future.
+pub(crate) unsafe fn rearm(node: NonNull<Signal>, cx: &mut Context<'_>) -> Poll<usize> {
+    let node = node.as_ptr();
+    // SAFETY: the caller guarantees the node is alive; raw place accesses
+    // avoid forming a reference to the whole node while a signaler may be
+    // touching it.
+    if unsafe { (*node).waker.register(cx.waker()) } == Registered::Armed {
+        return Poll::Pending;
+    }
+    let value = unsafe { (*node).value.load(Ordering::Acquire) };
+    if value >= SIGNAL_SIGNALED {
+        return Poll::Ready(value);
+    }
+    cx.waker().wake_by_ref();
+    Poll::Pending
 }

@@ -21,6 +21,19 @@ pub(crate) enum WakerSlot {
     Async(Waker),
 }
 
+/// Outcome of [`DynamicWaker::register`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Registered {
+    /// The slot already held a waker or thread handle: the registered waker
+    /// is the one a signaler will find from now on.
+    Armed,
+    /// The slot was empty. For a queued entry that had a waker registered
+    /// before, this means a signaler already took that waker and is about to
+    /// publish (or has published) the signal, which will never reach the
+    /// waker stored by this call.
+    WasEmpty,
+}
+
 /// A slot holding the current waker (none, a thread handle, or an async
 /// waker), protected by a tiny spin lock.
 ///
@@ -65,8 +78,10 @@ impl DynamicWaker {
     ///   (`!val.will_wake(waker)`).
     /// * If the slot holds any other variant (`None` or `Sync`), it is
     ///   overwritten with the new async waker.
+    ///
+    /// Reports whether the slot was empty beforehand, see [`Registered`].
     #[inline(always)]
-    pub(crate) fn register(&self, waker: &Waker) {
+    pub(crate) fn register(&self, waker: &Waker) -> Registered {
         // Spin until we acquire the lock.
         let backoff = Backoff::new();
         while self.updating.swap(true, Ordering::Acquire) {
@@ -74,8 +89,9 @@ impl DynamicWaker {
         }
 
         // SAFETY: We have exclusive access because `updating` is set to true.
-        unsafe {
+        let outcome = unsafe {
             self.value.with_mut(|slot| {
+                let was_empty = matches!(&*slot, WakerSlot::None);
                 if let WakerSlot::Async(val) = &mut *slot {
                     // Replace only if the new waker would cause a different
                     // wake.
@@ -85,11 +101,17 @@ impl DynamicWaker {
                 } else {
                     *slot = WakerSlot::Async(waker.clone());
                 }
-            });
-        }
+                if was_empty {
+                    Registered::WasEmpty
+                } else {
+                    Registered::Armed
+                }
+            })
+        };
 
         // Release the lock.
         self.updating.store(false, Ordering::Release);
+        outcome
     }
 
     /// Take the current `WakerSlot` out of the container, leaving `None`
@@ -134,14 +156,20 @@ impl DynamicWaker {
         }
     }
 
-    pub(crate) fn register(&self, waker: &Waker) {
+    pub(crate) fn register(&self, waker: &Waker) -> Registered {
         let mut slot = self.value.lock().unwrap();
+        let was_empty = matches!(&*slot, WakerSlot::None);
         if let WakerSlot::Async(val) = &mut *slot {
             if !val.will_wake(waker) {
                 *val = waker.clone();
             }
         } else {
             *slot = WakerSlot::Async(waker.clone());
+        }
+        if was_empty {
+            Registered::WasEmpty
+        } else {
+            Registered::Armed
         }
     }
 
@@ -152,3 +180,26 @@ impl DynamicWaker {
 
 unsafe impl Send for DynamicWaker {}
 unsafe impl Sync for DynamicWaker {}
+
+#[cfg(all(test, not(loom)))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn register_reports_whether_the_slot_was_empty() {
+        let dw = DynamicWaker::new();
+        assert_eq!(dw.register(Waker::noop()), Registered::WasEmpty);
+        assert_eq!(dw.register(Waker::noop()), Registered::Armed);
+        assert!(matches!(dw.take(), WakerSlot::Async(_)));
+        assert!(matches!(dw.take(), WakerSlot::None));
+        // A signaler consumed the waker: a re-poll must learn that the waker
+        // it stores now will not be woken by that signal.
+        assert_eq!(dw.register(Waker::noop()), Registered::WasEmpty);
+
+        #[cfg(feature = "std")]
+        {
+            let dw = DynamicWaker::new_sync();
+            assert_eq!(dw.register(Waker::noop()), Registered::Armed);
+        }
+    }
+}

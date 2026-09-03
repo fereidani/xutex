@@ -16,7 +16,7 @@ use branches::{likely, unlikely};
 use crate::backoff::Backoff;
 use crate::shim::const_fn;
 use crate::shim::sync::atomic::{AtomicUsize, Ordering};
-use crate::wait_queue::{PoppedChain, WaitQueue};
+use crate::wait_queue::{PoppedChain, WaitQueue, rearm};
 use crate::{
     SIGNAL_CLOSED, SIGNAL_INIT_WAITING, SIGNAL_RETURNED, SIGNAL_SIGNALED, SIGNAL_UNINIT, Signal,
 };
@@ -422,7 +422,15 @@ impl SemCore {
         // alive; fields are reached through raw places so no reference to the
         // whole node is held while a signaler may touch it.
         let node = entry.as_ptr();
-        let sig_val = unsafe { (*node).value.load(Ordering::Acquire) };
+        let mut sig_val = unsafe { (*node).value.load(Ordering::Acquire) };
+        if sig_val == SIGNAL_INIT_WAITING {
+            // Queued: re-arm the waker, or learn that the signal is already
+            // in flight and consume it below.
+            match unsafe { rearm(entry, cx) } {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(value) => sig_val = value,
+            }
+        }
         if likely(sig_val >= SIGNAL_SIGNALED) {
             if unlikely(sig_val == SIGNAL_RETURNED) {
                 unreachable!("acquire polled after completion");
@@ -434,10 +442,6 @@ impl SemCore {
                 return Poll::Ready(Err(AcquireError(())));
             }
             return Poll::Ready(Ok(()));
-        }
-        if sig_val == SIGNAL_INIT_WAITING {
-            unsafe { (*node).waker.register(cx.waker()) };
-            return Poll::Pending;
         }
         debug_assert_eq!(sig_val, SIGNAL_UNINIT);
         match self.try_acquire(n) {

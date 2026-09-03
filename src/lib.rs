@@ -55,7 +55,7 @@ use crate::shim::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::{
     allocator::{allocate_queue, deallocate_queue},
-    wait_queue::signal_node,
+    wait_queue::{rearm, signal_node},
     waker::DynamicWaker,
 };
 use backoff::Backoff;
@@ -343,7 +343,16 @@ impl<'a, T> Future for AsyncLockRequest<'a, T> {
         cx: &mut core::task::Context<'_>,
     ) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
-        let sig_val = this.entry.value.load(Ordering::Acquire);
+        let mut sig_val = this.entry.value.load(Ordering::Acquire);
+        if unlikely(sig_val == SIGNAL_INIT_WAITING) {
+            // Queued: re-arm the waker, or learn that the handoff is already
+            // in flight and take it below.
+            // SAFETY: the entry is pinned inside this future and alive.
+            match unsafe { rearm(NonNull::new_unchecked(&raw mut this.entry), cx) } {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(value) => sig_val = value,
+            }
+        }
         if likely(sig_val >= SIGNAL_SIGNALED) {
             if unlikely(sig_val == SIGNAL_RETURNED) {
                 unreachable!(
@@ -354,92 +363,86 @@ impl<'a, T> Future for AsyncLockRequest<'a, T> {
             this.entry.value.store(SIGNAL_RETURNED, Ordering::Relaxed);
             return Poll::Ready(unsafe { this.mutex.create_guard() });
         }
-        if unlikely(sig_val == SIGNAL_INIT_WAITING) {
-            this.entry.waker.register(cx.waker());
-            Poll::Pending
-        } else {
-            let backoff = Backoff::new();
-            let mut need_initialization = true;
-            loop {
-                let locking_result = this.mutex.queue.compare_exchange(
-                    UNLOCKED,
+        debug_assert_eq!(sig_val, SIGNAL_UNINIT);
+        let backoff = Backoff::new();
+        let mut need_initialization = true;
+        loop {
+            let locking_result = this.mutex.queue.compare_exchange(
+                UNLOCKED,
+                LOCKED,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            );
+
+            if likely(locking_result.is_ok()) {
+                this.entry.value.store(SIGNAL_RETURNED, Ordering::Relaxed);
+                return Poll::Ready(unsafe { this.mutex.create_guard() });
+            }
+
+            if need_initialization {
+                this.entry
+                    .value
+                    .store(SIGNAL_INIT_WAITING, Ordering::Release);
+                this.entry.waker.register(cx.waker());
+                need_initialization = false;
+            }
+
+            let mut ptr = locking_result.unwrap_err();
+
+            if unlikely(ptr == UPDATING) {
+                backoff.snooze();
+                continue;
+            }
+
+            if ptr == LOCKED {
+                // init queue
+                let updating_token_init_result = this.mutex.queue.compare_exchange(
                     LOCKED,
+                    UPDATING,
                     Ordering::Acquire,
                     Ordering::Relaxed,
                 );
 
-                if likely(locking_result.is_ok()) {
-                    this.entry.value.store(SIGNAL_RETURNED, Ordering::Relaxed);
-                    return Poll::Ready(unsafe { this.mutex.create_guard() });
-                }
-
-                if need_initialization {
-                    this.entry
-                        .value
-                        .store(SIGNAL_INIT_WAITING, Ordering::Release);
-                    this.entry.waker.register(cx.waker());
-                    need_initialization = false;
-                }
-
-                let mut ptr = locking_result.unwrap_err();
-
-                if unlikely(ptr == UPDATING) {
+                if unlikely(updating_token_init_result.is_err()) {
                     backoff.snooze();
                     continue;
                 }
 
-                if ptr == LOCKED {
-                    // init queue
-                    let updating_token_init_result = this.mutex.queue.compare_exchange(
-                        LOCKED,
-                        UPDATING,
-                        Ordering::Acquire,
-                        Ordering::Relaxed,
-                    );
+                ptr = allocate_queue();
+            } else {
+                let is_tagged;
+                (ptr, is_tagged) = untag_pointer(ptr);
 
-                    if unlikely(updating_token_init_result.is_err()) {
-                        backoff.snooze();
-                        continue;
-                    }
-
-                    ptr = allocate_queue();
-                } else {
-                    let is_tagged;
-                    (ptr, is_tagged) = untag_pointer(ptr);
-
-                    if unlikely(is_tagged) {
-                        backoff.snooze();
-                        continue;
-                    }
-
-                    // try to tag it
-                    let tagged_ptr = tag_pointer(ptr);
-                    let tagging_result = this.mutex.queue.compare_exchange(
-                        ptr,
-                        tagged_ptr,
-                        Ordering::Acquire,
-                        Ordering::Relaxed,
-                    );
-
-                    if unlikely(tagging_result.is_err()) {
-                        backoff.snooze();
-                        continue;
-                    }
+                if unlikely(is_tagged) {
+                    backoff.snooze();
+                    continue;
                 }
 
-                unsafe {
-                    // SAFETY: ptr is tagged and we have exclusive access to the
-                    // queue. We guarantee that the entry lives long enough, or
-                    // is removed from the queue on drop.
-                    (*ptr).with_mut(|queue| {
-                        (*queue).push(NonNull::new_unchecked(&raw mut this.entry))
-                    });
+                // try to tag it
+                let tagged_ptr = tag_pointer(ptr);
+                let tagging_result = this.mutex.queue.compare_exchange(
+                    ptr,
+                    tagged_ptr,
+                    Ordering::Acquire,
+                    Ordering::Relaxed,
+                );
+
+                if unlikely(tagging_result.is_err()) {
+                    backoff.snooze();
+                    continue;
                 }
-
-                this.mutex.queue.store(ptr, Ordering::Release);
-
-                return Poll::Pending;
             }
+
+            unsafe {
+                // SAFETY: ptr is tagged and we have exclusive access to the
+                // queue. We guarantee that the entry lives long enough, or
+                // is removed from the queue on drop.
+                (*ptr).with_mut(|queue| (*queue).push(NonNull::new_unchecked(&raw mut this.entry)));
+            }
+
+            this.mutex.queue.store(ptr, Ordering::Release);
+
+            return Poll::Pending;
         }
     }
 }

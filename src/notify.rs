@@ -29,7 +29,7 @@ use branches::{likely, unlikely};
 use crate::backoff::Backoff;
 use crate::shim::const_fn;
 use crate::shim::sync::atomic::{AtomicUsize, Ordering};
-use crate::wait_queue::{PoppedChain, WaitQueue, signal_node};
+use crate::wait_queue::{PoppedChain, WaitQueue, rearm, signal_node};
 use crate::{
     SIGNAL_ALL, SIGNAL_INIT_WAITING, SIGNAL_RETURNED, SIGNAL_SIGNALED, SIGNAL_UNINIT, Signal,
 };
@@ -534,17 +534,22 @@ impl Future for AsyncNotified<'_> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         // SAFETY: we never move out of `this`; the entry stays pinned.
         let this = unsafe { self.get_unchecked_mut() };
-        let sig_val = this.entry.value.load(Ordering::Acquire);
+        let mut sig_val = this.entry.value.load(Ordering::Acquire);
+        if sig_val == SIGNAL_INIT_WAITING {
+            // Queued: re-arm the waker, or learn that the signal is already
+            // in flight and consume it below.
+            // SAFETY: the entry is pinned inside this future and alive.
+            match unsafe { rearm(NonNull::new_unchecked(&raw mut this.entry), cx) } {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(value) => sig_val = value,
+            }
+        }
         if likely(sig_val >= SIGNAL_SIGNALED) {
             if unlikely(sig_val == SIGNAL_RETURNED) {
                 unreachable!("notified future polled after completion");
             }
             this.entry.value.store(SIGNAL_RETURNED, Ordering::Relaxed);
             return Poll::Ready(());
-        }
-        if sig_val == SIGNAL_INIT_WAITING {
-            this.entry.waker.register(cx.waker());
-            return Poll::Pending;
         }
         debug_assert_eq!(sig_val, SIGNAL_UNINIT);
         if this.core.try_complete(this.captured_gen) {
