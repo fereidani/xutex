@@ -266,7 +266,20 @@ impl<T> OnceCellInternal<T> {
 
     /// Blocking `get_or_try_init`.
     #[cfg(any(feature = "std", loom))]
+    #[inline]
     fn get_or_try_init_sync<E>(&self, f: impl FnOnce() -> Result<T, E>) -> Result<&T, E> {
+        if let Some(value) = self.get() {
+            return Ok(value);
+        }
+        self.get_or_try_init_sync_slow(f)
+    }
+
+    /// Slow half of [`Self::get_or_try_init_sync`]: the cell was not ready
+    /// at the time of the check, so initialize or wait.
+    #[cfg(any(feature = "std", loom))]
+    #[cold]
+    #[inline(never)]
+    fn get_or_try_init_sync_slow<E>(&self, f: impl FnOnce() -> Result<T, E>) -> Result<&T, E> {
         let mut f = Some(f);
         loop {
             match self.core.state.load(Ordering::Acquire) {
