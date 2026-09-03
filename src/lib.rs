@@ -1094,7 +1094,7 @@ impl<T> AsyncMutex<T> {
         unsafe { &*(self as *const AsyncMutex<T> as *const Mutex<T>) }
     }
 
-    /// Converts this `AsyncMutex<T>` into a `Mutex<T>` without allocating.W
+    /// Converts this `AsyncMutex<T>` into a `Mutex<T>` without allocating.
     ///
     /// Both structs are `#[repr(C)]` and have identical layout, so the
     /// conversion is sound.
