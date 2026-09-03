@@ -282,8 +282,154 @@ pub(crate) const SIGNAL_RETRY: usize = 5;
 pub(crate) const SIGNAL_RETURNED: usize = !0;
 
 impl<'a, T> AsyncLockRequest<'a, T> {
+    /// Contended first poll: the fast-path CAS failed with `ptr` as the
+    /// observed queue word. Registers the waker and parks the entry in the
+    /// wait queue (allocating the queue if it does not exist yet), retrying
+    /// the lock itself whenever the queue is in a transient state.
+    ///
+    /// Out of line so every `.await` site only inlines the single-CAS fast
+    /// path; the queue machinery is instantiated once per `T`.
     #[cold]
     #[inline(never)]
+    fn enqueue(
+        &mut self,
+        mut ptr: *mut QueueStructure,
+        cx: &mut core::task::Context<'_>,
+    ) -> Poll<MutexGuard<'a, T>> {
+        // Prepare the entry for parking. It is not reachable by anyone
+        // else until it is pushed below, so the waker slot needs no lock.
+        self.entry
+            .value
+            .store(SIGNAL_INIT_WAITING, Ordering::Release);
+        // SAFETY: the entry is not queued yet; only this future can see it.
+        unsafe { self.entry.waker.register_unsync(cx.waker()) };
+        let backoff = Backoff::new();
+        loop {
+            // `ptr` is the queue word observed by the most recent failed
+            // lock CAS (a relaxed read: it only selects the next step, the
+            // tag CAS below is what synchronizes with the queue).
+            if unlikely(ptr == UPDATING) {
+                backoff.snooze();
+            } else if ptr == LOCKED {
+                // init queue
+                let updating_token_init_result = self.mutex.queue.compare_exchange(
+                    LOCKED,
+                    UPDATING,
+                    Ordering::Acquire,
+                    Ordering::Relaxed,
+                );
+                if likely(updating_token_init_result.is_ok()) {
+                    return self.push_and_publish(allocate_queue());
+                }
+                backoff.snooze();
+            } else {
+                let (untagged, is_tagged) = untag_pointer(ptr);
+                if unlikely(is_tagged) {
+                    backoff.snooze();
+                } else {
+                    // try to tag it
+                    let tagging_result = self.mutex.queue.compare_exchange(
+                        untagged,
+                        tag_pointer(untagged),
+                        Ordering::Acquire,
+                        Ordering::Relaxed,
+                    );
+                    if likely(tagging_result.is_ok()) {
+                        return self.push_and_publish(untagged);
+                    }
+                    backoff.snooze();
+                }
+            }
+
+            // The queue was in flux: the lock may have been released in the
+            // meantime, so retry it before looking at the queue again.
+            match self.mutex.queue.compare_exchange(
+                UNLOCKED,
+                LOCKED,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    self.entry.value.store(SIGNAL_RETURNED, Ordering::Relaxed);
+                    // SAFETY: the CAS acquired the lock.
+                    return Poll::Ready(unsafe { self.mutex.create_guard() });
+                }
+                Err(actual) => ptr = actual,
+            }
+        }
+    }
+
+    /// Pushes the entry onto `ptr`, a queue this future has exclusive
+    /// access to (freshly allocated behind `UPDATING`, or tag-locked), and
+    /// publishes the queue again.
+    #[inline(always)]
+    fn push_and_publish(&mut self, ptr: *mut QueueStructure) -> Poll<MutexGuard<'a, T>> {
+        unsafe {
+            // SAFETY: ptr is tagged (or unpublished) and we have exclusive
+            // access to the queue. We guarantee that the entry lives long
+            // enough, or is removed from the queue on drop.
+            (*ptr).with_mut(|queue| (*queue).push(NonNull::new_unchecked(&raw mut self.entry)));
+        }
+        self.mutex.queue.store(ptr, Ordering::Release);
+        Poll::Pending
+    }
+
+    /// Re-poll of a request that is (or was) queued: `sig_val` is anything
+    /// but `SIGNAL_UNINIT`/`SIGNAL_SIGNALED`, which the inline fast path
+    /// handles itself.
+    #[cold]
+    #[inline(never)]
+    fn poll_queued(
+        &mut self,
+        sig_val: usize,
+        cx: &mut core::task::Context<'_>,
+    ) -> Poll<MutexGuard<'a, T>> {
+        if unlikely(sig_val == SIGNAL_RETURNED) {
+            unreachable!("Mutex guard has already been returned, poll after ready state detected");
+        }
+        debug_assert_eq!(sig_val, SIGNAL_INIT_WAITING);
+        // Queued: re-arm the waker, or learn that the handoff is already in
+        // flight and take it.
+        // SAFETY: the entry is pinned inside this future and alive.
+        match unsafe { rearm(NonNull::new_unchecked(&raw mut self.entry), cx) } {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(value) => {
+                debug_assert_eq!(value, SIGNAL_SIGNALED);
+                self.entry.value.store(SIGNAL_RETURNED, Ordering::Relaxed);
+                // SAFETY: signaled by the mutex drop, the lock is ours.
+                Poll::Ready(unsafe { self.mutex.create_guard() })
+            }
+        }
+    }
+
+    /// Drop of a request that was queued (`SIGNAL_INIT_WAITING`) or handed
+    /// the lock without noticing (`SIGNAL_SIGNALED`).
+    #[cold]
+    #[inline(never)]
+    fn drop_slow(&mut self, value: usize) {
+        if value == SIGNAL_SIGNALED {
+            // The lock was handed to us but the future was dropped before
+            // observing it: release the lock so it is not leaked.
+            // SAFETY: SIGNAL_SIGNALED means we own the lock.
+            drop(unsafe { self.mutex.create_guard() });
+            return;
+        }
+        debug_assert_eq!(value, SIGNAL_INIT_WAITING);
+        if self.remove_from_queue() {
+            return;
+        }
+        // we failed to remove ourself so we need to wait synchronously for the
+        // lock, this usually wouldn't take much as other one acquired
+        // our pointer and soon will be signaled. the spin is likely to
+        // never happen.
+        let backoff = Backoff::new();
+        while self.entry.value.load(Ordering::Acquire) != SIGNAL_SIGNALED {
+            backoff.snooze();
+        }
+        // SAFETY: we have the lock now, load it and drop it.
+        drop(unsafe { self.mutex.create_guard() });
+    }
+
     fn remove_from_queue(&mut self) -> bool {
         // Find and remove ourselves from the queue
         let backoff = Backoff::new();
@@ -339,139 +485,49 @@ impl<'a, T> AsyncLockRequest<'a, T> {
 impl<'a, T> Future for AsyncLockRequest<'a, T> {
     type Output = MutexGuard<'a, T>;
 
+    #[inline]
     fn poll(
         self: core::pin::Pin<&mut Self>,
         cx: &mut core::task::Context<'_>,
     ) -> Poll<Self::Output> {
+        // SAFETY: we never move out of `this`; the entry stays pinned.
         let this = unsafe { self.get_unchecked_mut() };
-        let mut sig_val = this.entry.value.load(Ordering::Acquire);
-        if unlikely(sig_val == SIGNAL_INIT_WAITING) {
-            // Queued: re-arm the waker, or learn that the handoff is already
-            // in flight and take it below.
-            // SAFETY: the entry is pinned inside this future and alive.
-            match unsafe { rearm(NonNull::new_unchecked(&raw mut this.entry), cx) } {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(value) => sig_val = value,
-            }
-        }
-        if likely(sig_val >= SIGNAL_SIGNALED) {
-            if unlikely(sig_val == SIGNAL_RETURNED) {
-                unreachable!(
-                    "Mutex guard has already been returned, poll after ready state detected"
-                );
-            }
-            // SAFETY: signaled by the mutex drop
-            this.entry.value.store(SIGNAL_RETURNED, Ordering::Relaxed);
-            return Poll::Ready(unsafe { this.mutex.create_guard() });
-        }
-        debug_assert_eq!(sig_val, SIGNAL_UNINIT);
-        let backoff = Backoff::new();
-        let mut need_initialization = true;
-        loop {
-            let locking_result = this.mutex.queue.compare_exchange(
+        let sig_val = this.entry.value.load(Ordering::Acquire);
+        if sig_val == SIGNAL_UNINIT {
+            // First poll: the uncontended acquisition is a single CAS.
+            return match this.mutex.queue.compare_exchange(
                 UNLOCKED,
                 LOCKED,
                 Ordering::Acquire,
                 Ordering::Relaxed,
-            );
-
-            if likely(locking_result.is_ok()) {
-                this.entry.value.store(SIGNAL_RETURNED, Ordering::Relaxed);
-                return Poll::Ready(unsafe { this.mutex.create_guard() });
-            }
-
-            if need_initialization {
-                this.entry
-                    .value
-                    .store(SIGNAL_INIT_WAITING, Ordering::Release);
-                // SAFETY: the entry is not queued yet; only this future can
-                // see it.
-                unsafe { this.entry.waker.register_unsync(cx.waker()) };
-                need_initialization = false;
-            }
-
-            let mut ptr = locking_result.unwrap_err();
-
-            if unlikely(ptr == UPDATING) {
-                backoff.snooze();
-                continue;
-            }
-
-            if ptr == LOCKED {
-                // init queue
-                let updating_token_init_result = this.mutex.queue.compare_exchange(
-                    LOCKED,
-                    UPDATING,
-                    Ordering::Acquire,
-                    Ordering::Relaxed,
-                );
-
-                if unlikely(updating_token_init_result.is_err()) {
-                    backoff.snooze();
-                    continue;
+            ) {
+                Ok(_) => {
+                    this.entry.value.store(SIGNAL_RETURNED, Ordering::Relaxed);
+                    // SAFETY: the CAS acquired the lock.
+                    Poll::Ready(unsafe { this.mutex.create_guard() })
                 }
-
-                ptr = allocate_queue();
-            } else {
-                let is_tagged;
-                (ptr, is_tagged) = untag_pointer(ptr);
-
-                if unlikely(is_tagged) {
-                    backoff.snooze();
-                    continue;
-                }
-
-                // try to tag it
-                let tagged_ptr = tag_pointer(ptr);
-                let tagging_result = this.mutex.queue.compare_exchange(
-                    ptr,
-                    tagged_ptr,
-                    Ordering::Acquire,
-                    Ordering::Relaxed,
-                );
-
-                if unlikely(tagging_result.is_err()) {
-                    backoff.snooze();
-                    continue;
-                }
-            }
-
-            unsafe {
-                // SAFETY: ptr is tagged and we have exclusive access to the
-                // queue. We guarantee that the entry lives long enough, or
-                // is removed from the queue on drop.
-                (*ptr).with_mut(|queue| (*queue).push(NonNull::new_unchecked(&raw mut this.entry)));
-            }
-
-            this.mutex.queue.store(ptr, Ordering::Release);
-
-            return Poll::Pending;
+                Err(ptr) => this.enqueue(ptr, cx),
+            };
         }
+        if sig_val == SIGNAL_SIGNALED {
+            // The unlocking side handed the lock to us and woke us up.
+            this.entry.value.store(SIGNAL_RETURNED, Ordering::Relaxed);
+            // SAFETY: signaled by the mutex drop, the lock is ours.
+            return Poll::Ready(unsafe { this.mutex.create_guard() });
+        }
+        this.poll_queued(sig_val, cx)
     }
 }
 
 impl<'a, T> Drop for AsyncLockRequest<'a, T> {
+    #[inline]
     fn drop(&mut self) {
         let value = self.entry.value.load(Ordering::Acquire);
-        if unlikely(value == SIGNAL_SIGNALED) {
-            // The lock was handed to us but the future was dropped before
-            // observing it: release the lock so it is not leaked.
-            // SAFETY: SIGNAL_SIGNALED means we own the lock.
-            drop(unsafe { self.mutex.create_guard() });
+        if value == SIGNAL_UNINIT || value == SIGNAL_RETURNED {
+            // Never queued, or completed normally: nothing to undo.
             return;
         }
-        if unlikely(value == SIGNAL_INIT_WAITING) && !self.remove_from_queue() {
-            // we failed to remove ourself so we need to wait synchronously for
-            // the lock, this usually wouldn't take much as other
-            // one acquired our pointer and soon will be signaled.
-            // the spin is likely to never happen.
-            let backoff = Backoff::new();
-            while self.entry.value.load(Ordering::Acquire) != SIGNAL_SIGNALED {
-                backoff.snooze();
-            }
-            // SAFETY: we have the lock now, load it and drop it.
-            drop(unsafe { self.mutex.create_guard() });
-        };
+        self.drop_slow(value);
     }
 }
 
