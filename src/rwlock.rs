@@ -131,6 +131,12 @@ macro_rules! rwlock_shared_impl {
 /// asynchronously via [`read_async`](Self::read_async)/
 /// [`write_async`](Self::write_async).
 ///
+/// Because queued writers block later readers, a thread that already holds a
+/// read guard must not take a second one while a writer may be waiting: the
+/// second read queues behind the writer, which in turn waits for the first
+/// read to be released, a deadlock (the same rule applies to tokio's
+/// `RwLock`).
+///
 /// # Examples
 ///
 /// ```
@@ -163,6 +169,12 @@ pub struct RwLock<T> {
 /// ([`AsyncReadRequest`]/[`AsyncWriteRequest`]) that are cancellation-safe
 /// and runtime-agnostic. Fair (write-preferring FIFO), with the same
 /// allocation-free waiter algorithm as [`crate::AsyncMutex`].
+///
+/// Because queued writers block later readers, a task that already holds a
+/// read guard must not await a second one while a writer may be waiting: the
+/// second read queues behind the writer, which in turn waits for the first
+/// read to be released, a deadlock (the same rule applies to tokio's
+/// `RwLock`).
 ///
 /// # Examples
 ///
