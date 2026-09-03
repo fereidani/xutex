@@ -105,7 +105,6 @@ impl Backoff {
     }
 
     #[inline(always)]
-    #[cold]
     pub fn snooze(&self) {
         (self.snooze_fn)(self);
     }
