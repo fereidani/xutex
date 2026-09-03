@@ -10,9 +10,12 @@ readme = "README.md"
 keywords = ["mutex", "thread", "async", "concurrency", "lock"]
 categories = ["concurrency", "asynchronous", "algorithms", "no-std"]
 
+[workspace]
+members = ["xutex-pool"]
+
 [dependencies]
 branches = "0.4"
-crossbeam-queue = "0.3"
+xutex-pool = { version = "1", path = "xutex-pool" }
 
 [dev-dependencies]
 criterion = "0.7"

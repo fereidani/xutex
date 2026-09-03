@@ -114,7 +114,7 @@ impl BarrierCore {
         };
         let mut chain = PoppedChain::new();
         locked.with_queue(|q| {
-            while let Some(front) = q.first() {
+            while let Some(front) = q.first::<Signal>() {
                 // SAFETY: queued nodes are valid under the tag-lock.
                 if unsafe { front.as_ref() }.aux.load(Ordering::Relaxed) != generation {
                     // Waiters of the next generation; FIFO order guarantees

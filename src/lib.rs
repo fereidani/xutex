@@ -14,12 +14,12 @@ use core::{
 
 mod allocator;
 mod backoff;
-#[cfg(not(feature = "std"))]
-mod oncelock;
 mod shim;
-mod signal_queue;
 mod waker;
-pub(crate) use signal_queue::SignalQueue;
+
+/// The intrusive wait queue lives in the semver-frozen `xutex-pool` crate so
+/// pooled queues are shared across every `xutex` version in the graph.
+pub(crate) use xutex_pool::SignalQueue;
 
 mod barrier;
 mod notify;
@@ -103,17 +103,45 @@ impl Signal {
     }
 }
 
-pub(crate) struct QueueStructure {
-    pub inner: UnsafeCell<SignalQueue>,
+// The pool crate's queue only touches the `next` link; the rest of `Signal`
+// stays version-private.
+unsafe impl xutex_pool::Node for Signal {
+    #[inline(always)]
+    unsafe fn get_next(node: NonNull<Self>) -> Option<NonNull<Self>> {
+        // SAFETY: forwarded caller guarantee — node live, link accessed under
+        // the queue lock.
+        unsafe { node.as_ref().next }
+    }
+
+    #[inline(always)]
+    unsafe fn set_next(mut node: NonNull<Self>, next: Option<NonNull<Self>>) {
+        // SAFETY: forwarded caller guarantee, see `get_next`.
+        unsafe { node.as_mut().next = next }
+    }
 }
 
+#[cfg(not(loom))]
+pub(crate) use xutex_pool::QueueStructure;
+
+/// Loom mirror of `xutex_pool::QueueStructure`: contents behind the loom
+/// `UnsafeCell` shim so queue accesses stay visible to the model checker.
+#[cfg(loom)]
+pub(crate) struct QueueStructure {
+    inner: UnsafeCell<SignalQueue>,
+}
+
+#[cfg(loom)]
 impl QueueStructure {
-    const_fn! {
-        pub(crate) const fn new() -> Self {
-            Self {
-                inner: UnsafeCell::new(SignalQueue::new()),
-            }
+    pub(crate) fn new() -> Self {
+        Self {
+            inner: UnsafeCell::new(SignalQueue::new()),
         }
+    }
+
+    /// See `xutex_pool::QueueStructure::with_mut`; under loom the access is
+    /// registered with the model checker.
+    pub(crate) unsafe fn with_mut<R>(&self, f: impl FnOnce(*mut SignalQueue) -> R) -> R {
+        unsafe { self.inner.with_mut(f) }
     }
 }
 
@@ -287,9 +315,7 @@ impl<'a, T> AsyncLockRequest<'a, T> {
             // Remove ourselves from the queue
             let result = unsafe {
                 // SAFETY: ptr is tagged and we have exclusive access
-                (*ptr)
-                    .inner
-                    .with_mut(|queue| (*queue).remove(NonNull::new_unchecked(&mut self.entry)))
+                (*ptr).with_mut(|queue| (*queue).remove(NonNull::new_unchecked(&mut self.entry)))
             };
             // Untag the queue we have guard
             self.mutex.queue.store(ptr, Ordering::Release);
@@ -395,9 +421,7 @@ impl<'a, T> Future for AsyncLockRequest<'a, T> {
                     // SAFETY: ptr is tagged and we have exclusive access to the
                     // queue. We guarantee that the entry lives long enough, or
                     // is removed from the queue on drop.
-                    (*ptr)
-                        .inner
-                        .with_mut(|queue| (*queue).push(NonNull::new_unchecked(&mut this.entry)));
+                    (*ptr).with_mut(|queue| (*queue).push(NonNull::new_unchecked(&mut this.entry)));
                 }
 
                 this.mutex.queue.store(ptr, Ordering::Release);
@@ -623,9 +647,7 @@ impl<T> Mutex<T> {
                 // SAFETY: ptr is tagged and we have exclusive access to the
                 // queue. We guarantee that the entry lives long enough by
                 // blocking here.
-                (*ptr)
-                    .inner
-                    .with_mut(|queue| (*queue).push(NonNull::new_unchecked(&mut entry)))
+                (*ptr).with_mut(|queue| (*queue).push(NonNull::new_unchecked(&mut entry)))
             };
 
             mutex.queue.store(ptr, Ordering::Release);
@@ -1256,7 +1278,7 @@ impl<'a, T> MutexGuard<'a, T> {
 
         let popped = unsafe {
             // SAFETY: ptr is tagged and we have exclusive access
-            (*ptr).inner.with_mut(|queue| (*queue).pop())
+            (*ptr).with_mut(|queue| (*queue).pop::<Signal>())
         };
 
         if let Some(entry) = popped {

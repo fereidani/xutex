@@ -1,0 +1,18 @@
+[package]
+name = "xutex-pool"
+version = "1.0.0"
+edition = "2024"
+authors = ["Khashayar Fereidani"]
+description = "shared global block pool for xutex; a single pool is shared by every xutex version in the dependency graph"
+license = "MIT"
+repository = "https://github.com/fereidani/xutex"
+readme = "README.md"
+keywords = ["mutex", "pool", "async", "concurrency", "lock"]
+categories = ["concurrency", "asynchronous", "memory-management", "no-std"]
+
+[dependencies]
+crossbeam-queue = { version = "0.3", default-features = false, features = ["alloc"] }
+
+[features]
+default = ["std"]
+std = ["crossbeam-queue/std"]

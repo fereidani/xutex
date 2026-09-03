@@ -213,7 +213,7 @@ impl NotifyCore {
         let live_gen = generation(self.state.load(Ordering::Relaxed));
         let mut chain = PoppedChain::new();
         locked.with_queue(|q| {
-            while let Some(front) = q.first() {
+            while let Some(front) = q.first::<Signal>() {
                 // SAFETY: nodes in the queue are valid under the tag-lock.
                 if unsafe { front.as_ref() }.aux.load(Ordering::Relaxed) == live_gen {
                     break;

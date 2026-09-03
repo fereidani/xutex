@@ -12,8 +12,9 @@
 //!   - `ptr | 1`  – the queue is tag-locked; the tag owner has exclusive access
 //!     to the queue contents.
 //! * The queue structure itself is the only heap object and comes from the
-//!   global pool in `allocator.rs`; it is returned to the pool as soon as the
-//!   last waiter leaves, so an uncontended primitive owns no heap memory.
+//!   global pool (`allocator.rs`, backed by the shared `xutex-pool` crate); it
+//!   is returned to the pool as soon as the last waiter leaves, so an
+//!   uncontended primitive owns no heap memory.
 //!
 //! Unlike the mutex, the pointer does not double as the lock state: primitives
 //! built on `WaitQueue` keep their own state word (permit counter, generation
@@ -183,7 +184,7 @@ impl<'a> LockedQueue<'a> {
     pub(crate) fn with_queue<R>(&mut self, f: impl FnOnce(&mut SignalQueue) -> R) -> R {
         // SAFETY: holding the tag-lock (or the unpublished fresh queue) grants
         // exclusive access to the queue contents.
-        unsafe { (*self.queue).inner.with_mut(|q| f(&mut *q)) }
+        unsafe { (*self.queue).with_mut(|q| f(&mut *q)) }
     }
 
     /// Publishes the queue again (or releases it back to the pool when it is

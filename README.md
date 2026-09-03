@@ -13,7 +13,7 @@
 - **🔄 Hybrid API**: Every primitive comes as a layout-identical `X`/`AsyncX` pair with zero-cost conversions (`as_async()`, `to_sync()`, `Arc` casts), so the same object serves blocking threads and async tasks
 - **⚡ 8-byte lock state**: Single `AtomicPtr` mutex state on 64-bit platforms (guarded data stored separately)
 - **🚀 Zero-allocation fast path**: Acquisition requires no heap allocation when uncontended; waiters are stack-allocated intrusive nodes, so even contended waits allocate nothing per waiter
-- **♻️ Smart allocation reuse**: The only heap object — the wait queue itself — is pooled and exists only while waiters are parked
+- **♻️ Smart allocation reuse**: The only heap object — the wait queue itself — is pooled and exists only while waiters are parked; the pool lives in the semver-frozen [`xutex-pool`](https://crates.io/crates/xutex-pool) crate, so even when several incompatible `xutex` versions coexist in one dependency graph they all share a single global pool
 - **🎯 Runtime-agnostic**: Works with Tokio, async-std, monoio, or any executor using `std::task::Waker`
 - **🔒 Lock-free fast path**: Single CAS operation for uncontended acquisition
 - **⚖️ Fair by construction**: Semaphore and RwLock are strict-FIFO (write-preferring RwLock, like tokio); no starvation

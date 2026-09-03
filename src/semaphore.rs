@@ -162,7 +162,9 @@ impl SemCore {
         let mut chain = PoppedChain::new();
         locked.with_queue(|queue| {
             while available > 0 {
-                let Some(front) = queue.first() else { break };
+                let Some(front) = queue.first::<Signal>() else {
+                    break;
+                };
                 // SAFETY: nodes in the queue are valid; we hold the tag-lock.
                 let front_ref = unsafe { front.as_ref() };
                 let remaining = front_ref.aux.load(Ordering::Relaxed);
