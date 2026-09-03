@@ -55,7 +55,8 @@ use crate::shim::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::{
     allocator::{allocate_queue, deallocate_queue},
-    waker::{DynamicWaker, WakerSlot},
+    wait_queue::signal_node,
+    waker::DynamicWaker,
 };
 use backoff::Backoff;
 use branches::{likely, unlikely};
@@ -1291,29 +1292,12 @@ impl<'a, T> MutexGuard<'a, T> {
         if let Some(entry) = popped {
             // untag pointer
             self.mutex.queue.store(ptr, Ordering::Release);
-            unsafe {
-                // SAFETY: entry is valid as it was pushed by a waiting task
-                let entry_ref = entry.as_ref();
-                // signal the waker to wake up, first acquire waker so if after signal waiter
-                // finished their function, it will be no race condition.
-                let waker = entry_ref.waker.take();
-
-                match waker {
-                    WakerSlot::None => {}
-                    #[cfg(feature = "std")]
-                    WakerSlot::Sync(thread) => {
-                        if entry_ref.value.swap(SIGNAL_SIGNALED, Ordering::AcqRel)
-                            == SIGNAL_INIT_WAITING
-                        {
-                            thread.unpark();
-                        }
-                    }
-                    WakerSlot::Async(waker) => {
-                        entry_ref.value.store(SIGNAL_SIGNALED, Ordering::Release);
-                        waker.wake();
-                    }
-                }
-            }
+            // Hand the lock over.
+            // SAFETY: the entry was popped under the tag and is exclusively
+            // ours until signaled; `signal_node` takes the waker before
+            // publishing the value, so the waiter may free the node the
+            // moment it observes the signal.
+            unsafe { signal_node(entry, SIGNAL_SIGNALED) };
         } else {
             // queue is untouched it is possible to release the queue and unlock
             self.mutex.queue.store(UNLOCKED, Ordering::Release);
