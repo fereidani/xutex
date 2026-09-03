@@ -293,6 +293,12 @@ impl<'a, T> AsyncLockRequest<'a, T> {
                 // Queue was deallocated or mutex is just locked, we're not in any queue
                 return false;
             }
+            if unlikely(ptr == UPDATING) {
+                // A waiter is allocating the queue: the sentinel must never be
+                // treated as a pointer, wait for the queue to be published.
+                backoff.snooze();
+                continue;
+            }
 
             let (ptr, is_tagged) = untag_pointer(ptr);
 
