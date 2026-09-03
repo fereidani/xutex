@@ -73,6 +73,7 @@ impl NotifyCore {
 
     /// Fast path of a wait: consume a stored permit or detect a generation
     /// advance. Returns `true` when the wait is already complete.
+    #[inline]
     fn try_complete(&self, captured_gen: usize) -> bool {
         let mut cur = self.state.load(Ordering::Relaxed);
         loop {
@@ -157,7 +158,30 @@ impl NotifyCore {
     }
 
     /// Wakes one waiter, or stores a permit for the next wait.
+    #[inline]
     pub(crate) fn notify_one(&self) {
+        let cur = self.state.load(Ordering::Relaxed);
+        if cur & HAS_QUEUE == 0 {
+            if cur & PERMIT != 0 {
+                // A permit is already stored; notify_one saturates at one.
+                return;
+            }
+            if self
+                .state
+                .compare_exchange(cur, cur | PERMIT, Ordering::Release, Ordering::Relaxed)
+                .is_ok()
+            {
+                return;
+            }
+        }
+        self.notify_one_slow();
+    }
+
+    /// Slow half of [`Self::notify_one`]: a queue exists or the state word
+    /// changed under the fast path.
+    #[cold]
+    #[inline(never)]
+    fn notify_one_slow(&self) {
         let mut cur = self.state.load(Ordering::Relaxed);
         loop {
             if cur & HAS_QUEUE != 0 {
@@ -244,6 +268,7 @@ impl NotifyCore {
 
     /// Blocking wait for a notification.
     #[cfg(any(feature = "std", loom))]
+    #[inline]
     pub(crate) fn wait(&self) {
         let captured_gen = generation(self.state.load(Ordering::Acquire));
         if self.try_complete(captured_gen) {
@@ -531,10 +556,28 @@ pub struct AsyncNotified<'a> {
 impl Future for AsyncNotified<'_> {
     type Output = ();
 
+    #[inline]
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         // SAFETY: we never move out of `this`; the entry stays pinned.
         let this = unsafe { self.get_unchecked_mut() };
-        let mut sig_val = this.entry.value.load(Ordering::Acquire);
+        let sig_val = this.entry.value.load(Ordering::Acquire);
+        // First poll with a stored permit (or a generation advance): the
+        // uncontended path is one CAS. Everything else stays out of line.
+        if sig_val == SIGNAL_UNINIT && this.core.try_complete(this.captured_gen) {
+            this.entry.value.store(SIGNAL_RETURNED, Ordering::Relaxed);
+            return Poll::Ready(());
+        }
+        this.poll_slow(sig_val, cx)
+    }
+}
+
+impl AsyncNotified<'_> {
+    /// Slow half of `poll`: re-polls of a queued future, consumption of an
+    /// in-flight signal, and enqueueing.
+    #[cold]
+    #[inline(never)]
+    fn poll_slow(&mut self, mut sig_val: usize, cx: &mut Context<'_>) -> Poll<()> {
+        let this = self;
         if sig_val == SIGNAL_INIT_WAITING {
             // Queued: re-arm the waker, or learn that the signal is already
             // in flight and consume it below.
@@ -579,6 +622,7 @@ impl Future for AsyncNotified<'_> {
 }
 
 impl Drop for AsyncNotified<'_> {
+    #[inline]
     fn drop(&mut self) {
         let value = self.entry.value.load(Ordering::Acquire);
         if likely(value == SIGNAL_UNINIT || value == SIGNAL_RETURNED) {
