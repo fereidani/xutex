@@ -21,13 +21,17 @@
 //!
 //! # Provenance
 //!
-//! The pool stores raw pointers and never round-trips a recycled queue
-//! through `Box::from_raw`/`Box::leak`: that would re-tag the allocation and
-//! invalidate pointers concurrent lockers loaded before the queue was pooled
-//! (their tag-CAS can legitimately succeed on a recycled queue at the same
-//! address — a benign ABA that must not invalidate provenance). A queue keeps
-//! its original borrow tag while in the pool cycle; `Box::from_raw` only runs
-//! when the pool is full and the queue is actually freed.
+//! The pool stores raw pointers and never frees a queue: once allocated, a
+//! queue's allocation (and with it the provenance of every pointer to it)
+//! lives for the rest of the process. That is what keeps the tag-CAS of the
+//! queue lock sound: a locker that loaded a queue pointer before the queue
+//! was returned to the pool can still see its CAS succeed after the queue
+//! has been recycled at the same address (a benign ABA), and it then touches
+//! a live allocation through a pointer that still carries that allocation's
+//! provenance. Freeing a queue and reallocating at the same address would
+//! break exactly that guarantee, so the pool is unbounded and its footprint
+//! is the peak number of simultaneously contended primitives, two pointer
+//! words each.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 #![warn(missing_docs)]
@@ -37,7 +41,7 @@ extern crate alloc;
 use alloc::boxed::Box;
 use core::ptr::{NonNull, null_mut};
 use core::sync::atomic::{AtomicPtr, Ordering};
-use crossbeam_queue::ArrayQueue;
+use crossbeam_queue::SegQueue;
 
 /// An intrusive wait-queue node: linked through a `next` pointer stored in
 /// the node itself, so enqueueing never allocates. Everything beyond the link
@@ -238,10 +242,10 @@ impl Default for QueueStructure {
 struct QueuePtr(*mut QueueStructure);
 unsafe impl Send for QueuePtr {}
 
-static POOL: AtomicPtr<ArrayQueue<QueuePtr>> = AtomicPtr::new(null_mut());
+static POOL: AtomicPtr<SegQueue<QueuePtr>> = AtomicPtr::new(null_mut());
 
 #[inline]
-fn pool() -> &'static ArrayQueue<QueuePtr> {
+fn pool() -> &'static SegQueue<QueuePtr> {
     let ptr = POOL.load(Ordering::Acquire);
     if !ptr.is_null() {
         // SAFETY: a published pool is never unpublished or freed.
@@ -253,7 +257,7 @@ fn pool() -> &'static ArrayQueue<QueuePtr> {
 /// Builds and publishes the pool; on losing the publication race, frees the
 /// local build and returns the winner's pool.
 #[cold]
-fn init_pool() -> &'static ArrayQueue<QueuePtr> {
+fn init_pool() -> &'static SegQueue<QueuePtr> {
     #[cfg(feature = "std")]
     let parallelism = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -261,10 +265,12 @@ fn init_pool() -> &'static ArrayQueue<QueuePtr> {
     #[cfg(not(feature = "std"))]
     let parallelism = 1;
 
-    let pool_cap = (parallelism * 16).min(128);
-    let queue = ArrayQueue::new(pool_cap);
-    for _ in 0..pool_cap {
-        let _ = queue.push(QueuePtr(Box::leak(Box::new(QueueStructure::new()))));
+    // Pre-fill so the first contended primitives find a queue ready; the pool
+    // grows on demand beyond this.
+    let prefill = (parallelism * 16).min(128);
+    let queue = SegQueue::new();
+    for _ in 0..prefill {
+        queue.push(QueuePtr(Box::leak(Box::new(QueueStructure::new()))));
     }
     let fresh = Box::into_raw(Box::new(queue));
     match POOL.compare_exchange(null_mut(), fresh, Ordering::AcqRel, Ordering::Acquire) {
@@ -298,7 +304,10 @@ pub fn allocate_queue() -> *mut QueueStructure {
     }
 }
 
-/// Returns a queue to the global pool, freeing it when the pool is full.
+/// Returns a queue to the global pool.
+///
+/// Pooled queues are never freed (see the crate docs on provenance); the
+/// pool simply grows to the peak number of queues ever in use at once.
 ///
 /// # Safety
 ///
@@ -307,12 +316,7 @@ pub fn allocate_queue() -> *mut QueueStructure {
 /// and not be accessed through this pointer afterwards.
 #[inline(always)]
 pub unsafe fn deallocate_queue(queue: *mut QueueStructure) {
-    if let Err(queue) = pool().push(QueuePtr(queue)) {
-        // Pool full: actually free the queue.
-        // SAFETY: the caller owns the queue exclusively and every pooled
-        // allocation was created by `Box::new` in this crate.
-        unsafe { drop(Box::from_raw(queue.0)) }
-    }
+    pool().push(QueuePtr(queue));
 }
 
 #[cfg(test)]
@@ -385,12 +389,17 @@ mod tests {
     }
 
     #[test]
-    fn overflow_allocates_and_frees() {
-        // Drain past the pool capacity to hit the fresh-allocation path, then
-        // return everything to hit the pool-full free path.
+    fn pool_grows_past_the_prefill() {
+        // Drain past the pre-filled queues to hit the fresh-allocation path,
+        // return everything, and check the grown pool hands them out again.
         let queues: alloc::vec::Vec<*mut QueueStructure> =
             (0..256).map(|_| allocate_queue()).collect();
         for queue in queues {
+            unsafe { deallocate_queue(queue) };
+        }
+        let again: alloc::vec::Vec<*mut QueueStructure> =
+            (0..256).map(|_| allocate_queue()).collect();
+        for queue in again {
             unsafe { deallocate_queue(queue) };
         }
     }

@@ -3,7 +3,10 @@
 Shared global block pool for [`xutex`](https://crates.io/crates/xutex).
 
 `xutex` primitives allocate a small wait-queue structure the first time a lock
-is contended and recycle it through a process-wide pool. This crate hosts that
+is contended and recycle it through a process-wide pool. Queues are recycled
+but never freed, so the pool's footprint is the peak number of simultaneously
+contended primitives (two pointer words each); that permanence is also what
+keeps the lock-free queue hand-off sound. This crate hosts that
 queue structure and its pool so they can be shared across *every* version of
 `xutex` in a dependency graph: all `xutex` versions depend on
 `xutex-pool = "1"`, cargo unifies every `1.x` requirement into a single copy
