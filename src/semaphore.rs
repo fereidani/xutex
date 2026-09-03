@@ -113,6 +113,7 @@ impl SemCore {
     /// release either observes `HAS_QUEUE` (and drains the queue) or the
     /// concurrent enqueuer's flag-setting RMW observes these permits — a
     /// lost wakeup is impossible.
+    #[inline]
     pub(crate) fn release(&self, n: usize) {
         if n == 0 {
             return;
@@ -333,6 +334,7 @@ impl SemCore {
 
     /// Blocking acquisition of `n` permits.
     #[cfg(any(feature = "std", loom))]
+    #[inline]
     pub(crate) fn acquire_sync(&self, n: usize) -> Result<(), AcquireError> {
         if likely(self.try_acquire(n).is_ok()) {
             return Ok(());
@@ -413,6 +415,7 @@ impl SemCore {
     /// acquisition and, if this ever returned `Poll::Pending`,
     /// [`Self::drop_acquire`] must be called before the node is invalidated
     /// (unless the acquisition completed).
+    #[inline]
     pub(crate) unsafe fn poll_acquire(
         &self,
         entry: NonNull<Signal>,
@@ -423,7 +426,36 @@ impl SemCore {
         // alive; fields are reached through raw places so no reference to the
         // whole node is held while a signaler may touch it.
         let node = entry.as_ptr();
-        let mut sig_val = unsafe { (*node).value.load(Ordering::Acquire) };
+        let sig_val = unsafe { (*node).value.load(Ordering::Acquire) };
+        // First poll with permits available: the uncontended path is the
+        // `try_acquire` CAS alone. Everything else is kept out of line so an
+        // `.await` site does not carry the queue machinery inline.
+        if sig_val == SIGNAL_UNINIT && self.try_acquire(n).is_ok() {
+            unsafe { (*node).value.store(SIGNAL_RETURNED, Ordering::Relaxed) };
+            return Poll::Ready(Ok(()));
+        }
+        // SAFETY: forwarded caller guarantee.
+        unsafe { self.poll_acquire_slow(entry, n, sig_val, cx) }
+    }
+
+    /// Slow half of [`Self::poll_acquire`]: `sig_val` is the entry state it
+    /// observed (any state; a fresh entry whose `try_acquire` just failed
+    /// or, rarely, raced with a release, re-checks the pool here).
+    ///
+    /// # Safety
+    ///
+    /// Same as [`Self::poll_acquire`].
+    #[cold]
+    #[inline(never)]
+    unsafe fn poll_acquire_slow(
+        &self,
+        entry: NonNull<Signal>,
+        n: usize,
+        mut sig_val: usize,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), AcquireError>> {
+        // SAFETY (all raw accesses below): see `poll_acquire`.
+        let node = entry.as_ptr();
         if sig_val == SIGNAL_INIT_WAITING {
             // Queued: re-arm the waker, or learn that the signal is already
             // in flight and consume it below.
@@ -1010,6 +1042,7 @@ pub struct AsyncAcquireRequest<'a> {
 impl<'a> Future for AsyncAcquireRequest<'a> {
     type Output = Result<SemaphorePermit<'a>, AcquireError>;
 
+    #[inline]
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         // SAFETY: we never move out of `this`; the entry stays pinned.
         let this = unsafe { self.get_unchecked_mut() };
@@ -1027,6 +1060,7 @@ impl<'a> Future for AsyncAcquireRequest<'a> {
 }
 
 impl Drop for AsyncAcquireRequest<'_> {
+    #[inline]
     fn drop(&mut self) {
         let value = self.entry.value.load(Ordering::Acquire);
         if unlikely(value != SIGNAL_UNINIT && value != SIGNAL_RETURNED) {
