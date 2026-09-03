@@ -1300,25 +1300,24 @@ pub struct MutexGuard<'a, T> {
 }
 
 impl<'a, T> MutexGuard<'a, T> {
+    /// Contended unlock: `ptr` is the queue word observed by the failed
+    /// `LOCKED -> UNLOCKED` CAS in `drop`.
+    ///
+    /// The unlock CAS is deliberately not retried here: while the lock is
+    /// held the word only ever moves `LOCKED -> UPDATING -> queue`, and only
+    /// the holder can take it back out of the queue states, so a retry could
+    /// never succeed and would just be one more RMW on the contended line.
     #[cold]
     #[inline(never)]
-    fn drop_slow(&mut self) {
+    fn drop_slow(&mut self, mut ptr: *mut QueueStructure) {
         let backoff = Backoff::new();
-        let unlock_result = self.mutex.queue.compare_exchange(
-            LOCKED,
-            UNLOCKED,
-            Ordering::Release,
-            Ordering::Acquire,
-        );
-        if likely(unlock_result.is_ok()) {
-            return;
-        }
-        let mut ptr = unlock_result.unwrap_err();
         loop {
-            // A stale value (the failed-unlock error or a racing snapshot)
-            // can show transient states; re-read until the queue pointer is
-            // stable and the tag is ours. While we hold the lock the queue
-            // address itself cannot change, so this terminates.
+            // A stale value (the failed-unlock error, a relaxed read, or a
+            // racing snapshot) can show transient states; re-read until the
+            // queue pointer is stable and the tag is ours. Only the tag CAS
+            // (Acquire) synchronizes with the queue contents. While we hold
+            // the lock the queue address itself cannot change, so this
+            // terminates.
             if ptr == UPDATING || ptr == LOCKED {
                 backoff.snooze();
                 ptr = wait_queue::spin_reload(&self.mutex.queue);
@@ -1384,16 +1383,14 @@ impl<T> Deref for MutexGuard<'_, T> {
 impl<T> Drop for MutexGuard<'_, T> {
     #[inline(always)]
     fn drop(&mut self) {
-        let unlock_result = self.mutex.queue.compare_exchange(
+        if let Err(ptr) = self.mutex.queue.compare_exchange(
             LOCKED,
             UNLOCKED,
             Ordering::Release,
             Ordering::Relaxed,
-        );
-        if likely(unlock_result.is_ok()) {
-            return;
+        ) {
+            self.drop_slow(ptr);
         }
-        self.drop_slow();
     }
 }
 
