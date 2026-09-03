@@ -384,7 +384,9 @@ impl<'a, T> Future for AsyncLockRequest<'a, T> {
                 this.entry
                     .value
                     .store(SIGNAL_INIT_WAITING, Ordering::Release);
-                this.entry.waker.register(cx.waker());
+                // SAFETY: the entry is not queued yet; only this future can
+                // see it.
+                unsafe { this.entry.waker.register_unsync(cx.waker()) };
                 need_initialization = false;
             }
 

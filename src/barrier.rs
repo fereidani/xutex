@@ -480,7 +480,9 @@ impl Future for AsyncBarrierWaitRequest<'_> {
                 this.entry
                     .value
                     .store(SIGNAL_INIT_WAITING, Ordering::Release);
-                this.entry.waker.register(cx.waker());
+                // SAFETY: the entry is not queued yet; only this future can
+                // see it.
+                unsafe { this.entry.waker.register_unsync(cx.waker()) };
                 // SAFETY: entry is pinned inside this future and the drop
                 // implementation removes it from the queue.
                 match unsafe {

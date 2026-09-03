@@ -787,7 +787,10 @@ where
                     self.entry
                         .value
                         .store(SIGNAL_INIT_WAITING, Ordering::Release);
-                    self.entry.waker.register(cx.waker());
+                    // SAFETY: the entry is not queued (a previous round was
+                    // popped and signaled, or it was never pushed); only this
+                    // future can see it.
+                    unsafe { self.entry.waker.register_unsync(cx.waker()) };
                     // SAFETY: the entry is pinned inside this future (the
                     // caller polls through Pin) and the drop implementation
                     // removes it from the queue.

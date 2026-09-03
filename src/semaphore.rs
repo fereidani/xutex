@@ -456,9 +456,13 @@ impl SemCore {
             }
             Err(TryAcquireError::NoPermits) => {}
         }
+        // Prepare the entry for parking. It is not reachable by anyone else
+        // until `enqueue_or_acquire` pushes it, so the waker slot needs no
+        // lock.
         unsafe {
             (*node).value.store(SIGNAL_INIT_WAITING, Ordering::Release);
-            (*node).waker.register(cx.waker());
+            // SAFETY: the entry is not queued yet; only this future sees it.
+            (*node).waker.register_unsync(cx.waker());
             (*node).aux.store(n, Ordering::Relaxed);
         }
         // SAFETY: forwarded caller guarantee (pin + cancel-on-drop).

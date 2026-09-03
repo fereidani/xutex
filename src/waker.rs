@@ -89,29 +89,34 @@ impl DynamicWaker {
         }
 
         // SAFETY: We have exclusive access because `updating` is set to true.
-        let outcome = unsafe {
-            self.value.with_mut(|slot| {
-                let was_empty = matches!(&*slot, WakerSlot::None);
-                if let WakerSlot::Async(val) = &mut *slot {
-                    // Replace only if the new waker would cause a different
-                    // wake.
-                    if !val.will_wake(waker) {
-                        *val = waker.clone();
-                    }
-                } else {
-                    *slot = WakerSlot::Async(waker.clone());
-                }
-                if was_empty {
-                    Registered::WasEmpty
-                } else {
-                    Registered::Armed
-                }
-            })
-        };
+        let outcome = unsafe { self.value.with_mut(|slot| store_async(&mut *slot, waker)) };
 
         // Release the lock.
         self.updating.store(false, Ordering::Release);
         outcome
+    }
+
+    /// [`register`](Self::register) for an entry that no other thread can
+    /// reach: skips the slot lock (an atomic swap plus a store on every
+    /// contended acquisition) because there is nothing to synchronize with.
+    ///
+    /// This is the initial registration done right before an entry is
+    /// pushed to a wait queue. Until the push publishes the entry, only the
+    /// owning future/thread can see it, so plain access is data-race free.
+    ///
+    /// # Safety
+    ///
+    /// The entry must not be linked into a wait queue and no signaler may
+    /// hold a pointer to it, i.e. no concurrent [`register`](Self::register)
+    /// or [`take`](Self::take) can be in progress.
+    #[inline(always)]
+    pub(crate) unsafe fn register_unsync(&self, waker: &Waker) {
+        debug_assert!(
+            !self.updating.load(Ordering::Relaxed),
+            "register_unsync on a slot whose lock is held"
+        );
+        // SAFETY: the caller guarantees exclusive access to the entry.
+        unsafe { self.value.with_mut(|slot| store_async(&mut *slot, waker)) };
     }
 
     /// Take the current `WakerSlot` out of the container, leaving `None`
@@ -133,6 +138,27 @@ impl DynamicWaker {
         // Release the lock.
         self.updating.store(false, Ordering::Release);
         value
+    }
+}
+
+/// Stores `waker` into `slot`, reusing the existing clone when it would wake
+/// the same task. Reports whether the slot was empty beforehand.
+#[cfg(not(loom))]
+#[inline(always)]
+fn store_async(slot: &mut WakerSlot, waker: &Waker) -> Registered {
+    let was_empty = matches!(slot, WakerSlot::None);
+    if let WakerSlot::Async(val) = slot {
+        // Replace only if the new waker would cause a different wake.
+        if !val.will_wake(waker) {
+            *val = waker.clone();
+        }
+    } else {
+        *slot = WakerSlot::Async(waker.clone());
+    }
+    if was_empty {
+        Registered::WasEmpty
+    } else {
+        Registered::Armed
     }
 }
 
@@ -173,6 +199,12 @@ impl DynamicWaker {
         }
     }
 
+    /// Under loom the slot lock is a real mutex, so the unsynchronized
+    /// registration simply takes it; the protocol being verified is the same.
+    pub(crate) unsafe fn register_unsync(&self, waker: &Waker) {
+        self.register(waker);
+    }
+
     pub(crate) fn take(&self) -> WakerSlot {
         core::mem::replace(&mut *self.value.lock().unwrap(), WakerSlot::None)
     }
@@ -201,5 +233,19 @@ mod tests {
             let dw = DynamicWaker::new_sync();
             assert_eq!(dw.register(Waker::noop()), Registered::Armed);
         }
+    }
+
+    #[test]
+    fn register_unsync_arms_an_unpublished_slot() {
+        let dw = DynamicWaker::new();
+        // SAFETY: the slot is local to this test and not shared.
+        unsafe { dw.register_unsync(Waker::noop()) };
+        assert!(matches!(dw.take(), WakerSlot::Async(_)));
+        // A stale async waker is replaced (or kept when it would wake the
+        // same task) exactly like the locked registration does.
+        unsafe { dw.register_unsync(Waker::noop()) };
+        assert_eq!(dw.register(Waker::noop()), Registered::Armed);
+        assert!(matches!(dw.take(), WakerSlot::Async(_)));
+        assert!(matches!(dw.take(), WakerSlot::None));
     }
 }
