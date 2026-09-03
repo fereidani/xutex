@@ -290,7 +290,8 @@ impl<'a, T> AsyncLockRequest<'a, T> {
         loop {
             let ptr = wait_queue::spin_reload(&self.mutex.queue);
             if ptr == UNLOCKED || ptr == LOCKED {
-                // Queue was deallocated or mutex is just locked, we're not in any queue
+                // Queue was deallocated or mutex is just locked, we're not in
+                // any queue
                 return false;
             }
             if unlikely(ptr == UPDATING) {
@@ -458,9 +459,10 @@ impl<'a, T> Drop for AsyncLockRequest<'a, T> {
             return;
         }
         if unlikely(value == SIGNAL_INIT_WAITING) && !self.remove_from_queue() {
-            // we failed to remove ourself so we need to wait synchronously for the lock,
-            // this usually wouldn't take much as other one acquired our pointer and soon
-            // will be signaled. the spin is likely to never happen.
+            // we failed to remove ourself so we need to wait synchronously for
+            // the lock, this usually wouldn't take much as other
+            // one acquired our pointer and soon will be signaled.
+            // the spin is likely to never happen.
             let backoff = Backoff::new();
             while self.entry.value.load(Ordering::Acquire) != SIGNAL_SIGNALED {
                 backoff.snooze();
