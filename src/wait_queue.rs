@@ -296,10 +296,12 @@ impl PoppedChain {
     /// while the queue tag-lock is still held.
     #[inline(always)]
     pub(crate) fn seal(&mut self) {
-        if let Some(mut last) = self.last {
+        if let Some(last) = self.last {
             // SAFETY: the node was popped under the tag-lock and has not been
-            // signaled yet, so we still own it exclusively.
-            unsafe { last.as_mut().next = None };
+            // signaled yet, so the link is ours. A raw place write: no
+            // reference to the whole node is formed while its owner may be
+            // reading `value`.
+            unsafe { (*last.as_ptr()).next = None };
         }
     }
 
@@ -312,7 +314,7 @@ impl PoppedChain {
         let mut cur = self.head;
         while let Some(node) = cur {
             // SAFETY: nodes in the chain are owned by us until signaled.
-            cur = unsafe { node.as_ref().next };
+            cur = unsafe { (*node.as_ptr()).next };
             // SAFETY: see above; this is the last access to the node.
             unsafe { signal_node(node, value) };
         }
@@ -330,24 +332,27 @@ impl PoppedChain {
 /// The caller must own the node (popped from a queue under the tag-lock) and
 /// must not access it again afterwards.
 pub(crate) unsafe fn signal_node(node: NonNull<Signal>, value: usize) {
-    // SAFETY: the caller guarantees the node is alive and exclusively ours.
-    let entry_ref = unsafe { node.as_ref() };
-    let waker = entry_ref.waker.take();
+    // SAFETY (all raw accesses below): the caller guarantees the node is
+    // alive and exclusively ours. Fields are reached through raw places so no
+    // reference to the whole node exists while its owner may be reading
+    // `value`.
+    let node = node.as_ptr();
+    let waker = unsafe { (*node).waker.take() };
     match waker {
         WakerSlot::None => {
             // The waiter is mid-cancellation and spinning on `value` (it
             // never registered a waker, or the waker was already consumed);
             // publishing the value alone releases it.
-            entry_ref.value.store(value, Ordering::Release);
+            unsafe { (*node).value.store(value, Ordering::Release) };
         }
         #[cfg(any(feature = "std", loom))]
         WakerSlot::Sync(thread) => {
-            if entry_ref.value.swap(value, Ordering::AcqRel) == SIGNAL_INIT_WAITING {
+            if unsafe { (*node).value.swap(value, Ordering::AcqRel) } == SIGNAL_INIT_WAITING {
                 thread.unpark();
             }
         }
         WakerSlot::Async(waker) => {
-            entry_ref.value.store(value, Ordering::Release);
+            unsafe { (*node).value.store(value, Ordering::Release) };
             waker.wake();
         }
     }

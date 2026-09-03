@@ -120,8 +120,9 @@ impl OnceCore {
     ///
     /// # Safety
     ///
-    /// `entry` must stay alive until it is signaled or removed.
-    unsafe fn enqueue_or_state(&self, entry: &mut Signal) -> WaitOutcome {
+    /// `entry` must point to a live node with a `None` link that stays alive
+    /// and in place until it is signaled or removed.
+    unsafe fn enqueue_or_state(&self, entry: NonNull<Signal>) -> WaitOutcome {
         let mut locked = self.queue.lock(true).unwrap();
         // An RMW returns the latest state: either the initializer's
         // completion/abort is visible here, or our enqueue is published
@@ -133,7 +134,7 @@ impl OnceCore {
         }
         locked.with_queue(|q| {
             // SAFETY: forwarded caller guarantee.
-            unsafe { q.push(NonNull::new_unchecked(entry)) }
+            unsafe { q.push(entry) }
         });
         locked.unlock(|| {});
         WaitOutcome::Enqueued
@@ -147,23 +148,27 @@ impl OnceCore {
     ///
     /// `entry` must be the same entry passed to `enqueue_or_state`.
     #[cold]
-    unsafe fn cancel_wait(&self, entry: &mut Signal) {
+    unsafe fn cancel_wait(&self, entry: NonNull<Signal>) {
         if let Some(mut locked) = self.queue.lock(false) {
             let found = locked.with_queue(|q| {
                 // SAFETY: queued nodes are alive under the tag-lock; our own
                 // node is compared by address only.
-                unsafe { q.remove(NonNull::new_unchecked(entry)) }
+                unsafe { q.remove(entry) }
             });
             locked.unlock(|| {});
             if found {
                 return;
             }
         }
+        // SAFETY: forwarded caller guarantee (the node is alive); raw place
+        // accesses so no reference to the whole node is held while the
+        // signaler touches it.
+        let node = entry.as_ptr();
         let backoff = Backoff::new();
-        let mut value = entry.value.load(Ordering::Acquire);
+        let mut value = unsafe { (*node).value.load(Ordering::Acquire) };
         while value < SIGNAL_SIGNALED {
             backoff.snooze();
-            value = entry.value.load(Ordering::Acquire);
+            value = unsafe { (*node).value.load(Ordering::Acquire) };
         }
         if value == SIGNAL_RETRY {
             // We were chosen to take over initialization but are being
@@ -291,8 +296,11 @@ impl<T> OnceCellInternal<T> {
                 _ => {
                     let mut entry = Signal::new_sync();
                     // SAFETY: the entry outlives its queue membership: we do
-                    // not leave this block before it is signaled.
-                    match unsafe { self.core.enqueue_or_state(&mut entry) } {
+                    // not leave this block before it is signaled. The pointer
+                    // is derived without a `&mut` to the node so the reads of
+                    // `entry.value` below alias the queued node soundly.
+                    let node = unsafe { NonNull::new_unchecked(&raw mut entry) };
+                    match unsafe { self.core.enqueue_or_state(node) } {
                         WaitOutcome::State => continue,
                         WaitOutcome::Enqueued => {
                             let mut value = entry.value.swap(SIGNAL_INIT_WAITING, Ordering::AcqRel);
@@ -777,7 +785,11 @@ where
                     // SAFETY: the entry is pinned inside this future (the
                     // caller polls through Pin) and the drop implementation
                     // removes it from the queue.
-                    match unsafe { self.internal.core.enqueue_or_state(&mut self.entry) } {
+                    match unsafe {
+                        self.internal
+                            .core
+                            .enqueue_or_state(NonNull::new_unchecked(&raw mut self.entry))
+                    } {
                         WaitOutcome::Enqueued => return Poll::Pending,
                         WaitOutcome::State => {
                             self.entry.reset();
@@ -854,7 +866,11 @@ impl<T, F, Fut> Drop for AsyncGetOrTryInit<'_, T, F, Fut> {
         // SIGNAL_INIT_WAITING: leave the queue (or wait out an in-flight
         // signal and re-deliver a retry if we swallowed one).
         // SAFETY: same entry as passed to enqueue_or_state.
-        unsafe { self.internal.core.cancel_wait(&mut self.entry) };
+        unsafe {
+            self.internal
+                .core
+                .cancel_wait(NonNull::new_unchecked(&raw mut self.entry))
+        };
     }
 }
 

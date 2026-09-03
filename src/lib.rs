@@ -110,13 +110,15 @@ unsafe impl xutex_pool::Node for Signal {
     unsafe fn get_next(node: NonNull<Self>) -> Option<NonNull<Self>> {
         // SAFETY: forwarded caller guarantee — node live, link accessed under
         // the queue lock.
-        unsafe { node.as_ref().next }
+        // Raw place accesses: no reference to the whole node is formed, its
+        // owner may be reading `value` concurrently.
+        unsafe { (*node.as_ptr()).next }
     }
 
     #[inline(always)]
-    unsafe fn set_next(mut node: NonNull<Self>, next: Option<NonNull<Self>>) {
+    unsafe fn set_next(node: NonNull<Self>, next: Option<NonNull<Self>>) {
         // SAFETY: forwarded caller guarantee, see `get_next`.
-        unsafe { node.as_mut().next = next }
+        unsafe { (*node.as_ptr()).next = next }
     }
 }
 
@@ -315,7 +317,8 @@ impl<'a, T> AsyncLockRequest<'a, T> {
             // Remove ourselves from the queue
             let result = unsafe {
                 // SAFETY: ptr is tagged and we have exclusive access
-                (*ptr).with_mut(|queue| (*queue).remove(NonNull::new_unchecked(&mut self.entry)))
+                (*ptr)
+                    .with_mut(|queue| (*queue).remove(NonNull::new_unchecked(&raw mut self.entry)))
             };
             // Untag the queue we have guard
             self.mutex.queue.store(ptr, Ordering::Release);
@@ -421,7 +424,9 @@ impl<'a, T> Future for AsyncLockRequest<'a, T> {
                     // SAFETY: ptr is tagged and we have exclusive access to the
                     // queue. We guarantee that the entry lives long enough, or
                     // is removed from the queue on drop.
-                    (*ptr).with_mut(|queue| (*queue).push(NonNull::new_unchecked(&mut this.entry)));
+                    (*ptr).with_mut(|queue| {
+                        (*queue).push(NonNull::new_unchecked(&raw mut this.entry))
+                    });
                 }
 
                 this.mutex.queue.store(ptr, Ordering::Release);
@@ -646,8 +651,10 @@ impl<T> Mutex<T> {
             let do_spin = unsafe {
                 // SAFETY: ptr is tagged and we have exclusive access to the
                 // queue. We guarantee that the entry lives long enough by
-                // blocking here.
-                (*ptr).with_mut(|queue| (*queue).push(NonNull::new_unchecked(&mut entry)))
+                // blocking here. The pointer is derived without a `&mut` to
+                // the node so the reads of `entry.value` below alias the
+                // queued node soundly.
+                (*ptr).with_mut(|queue| (*queue).push(NonNull::new_unchecked(&raw mut entry)))
             };
 
             mutex.queue.store(ptr, Ordering::Release);

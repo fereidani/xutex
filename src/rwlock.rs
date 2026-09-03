@@ -10,6 +10,7 @@ use core::fmt;
 use core::marker::PhantomPinned;
 use core::ops::{Deref, DerefMut};
 use core::pin::Pin;
+use core::ptr::NonNull;
 use core::task::{Context, Poll};
 
 #[cfg(all(feature = "std", not(loom)))]
@@ -521,8 +522,11 @@ macro_rules! rwlock_future {
                 let lock = this.lock;
                 let permits = $permits(lock);
                 // SAFETY: entry is pinned inside this future and
-                // cancel_acquire runs on drop.
-                match unsafe { lock.sem.poll_acquire(&mut this.entry, permits, cx) } {
+                // drop_acquire runs on drop.
+                match unsafe {
+                    lock.sem
+                        .poll_acquire(NonNull::new_unchecked(&raw mut this.entry), permits, cx)
+                } {
                     Poll::Ready(Ok(())) => Poll::Ready($guard { lock }),
                     // The internal semaphore is never closed.
                     Poll::Ready(Err(_)) => unreachable!("rwlock semaphore closed"),
@@ -537,7 +541,11 @@ macro_rules! rwlock_future {
                 if unlikely(value != SIGNAL_UNINIT && value != SIGNAL_RETURNED) {
                     let permits = $permits(self.lock);
                     // SAFETY: same entry as passed to poll_acquire.
-                    unsafe { self.lock.sem.drop_acquire(&mut self.entry, permits) };
+                    unsafe {
+                        self.lock
+                            .sem
+                            .drop_acquire(NonNull::new_unchecked(&raw mut self.entry), permits)
+                    };
                 }
             }
         }

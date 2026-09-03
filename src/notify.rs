@@ -102,8 +102,13 @@ impl NotifyCore {
     ///
     /// # Safety
     ///
-    /// `entry` must stay alive until it is signaled or removed.
-    unsafe fn enqueue_or_complete(&self, entry: &mut Signal, captured_gen: usize) -> WaitOutcome {
+    /// `entry` must point to a live node with a `None` link that stays alive
+    /// and in place until it is signaled or removed.
+    unsafe fn enqueue_or_complete(
+        &self,
+        entry: NonNull<Signal>,
+        captured_gen: usize,
+    ) -> WaitOutcome {
         let mut locked = self.queue.lock(true).unwrap();
         // Setting the flag is an RMW on the state word, so it returns the
         // *latest* generation/permit: either this happens before a
@@ -137,10 +142,12 @@ impl NotifyCore {
                     }
                 }
             }
-            entry.aux.store(captured_gen, Ordering::Relaxed);
+            // SAFETY: forwarded caller guarantee; `aux` is written through a
+            // raw place so no reference to the whole node is formed.
+            unsafe { (*entry.as_ptr()).aux.store(captured_gen, Ordering::Relaxed) };
             locked.with_queue(|q| {
                 // SAFETY: forwarded caller guarantee.
-                unsafe { q.push(NonNull::new_unchecked(entry)) }
+                unsafe { q.push(entry) }
             });
             locked.unlock(|| {
                 self.state.fetch_and(!HAS_QUEUE, Ordering::AcqRel);
@@ -215,8 +222,10 @@ impl NotifyCore {
         let mut chain = PoppedChain::new();
         locked.with_queue(|q| {
             while let Some(front) = q.first::<Signal>() {
-                // SAFETY: nodes in the queue are valid under the tag-lock.
-                if unsafe { front.as_ref() }.aux.load(Ordering::Relaxed) == live_gen {
+                // SAFETY: nodes in the queue are valid under the tag-lock;
+                // `aux` is read through a raw place so no reference to the
+                // whole node is formed.
+                if unsafe { (*front.as_ptr()).aux.load(Ordering::Relaxed) } == live_gen {
                     break;
                 }
                 // SAFETY: see above; FIFO pop order.
@@ -249,8 +258,11 @@ impl NotifyCore {
     fn wait_slow(&self, captured_gen: usize) {
         let mut entry = Signal::new_sync();
         // SAFETY: the entry outlives its queue membership: this function
-        // does not return before the entry is signaled.
-        match unsafe { self.enqueue_or_complete(&mut entry, captured_gen) } {
+        // does not return before the entry is signaled. The pointer is
+        // derived without a `&mut` to the node so the reads of `entry.value`
+        // below alias the queued node soundly.
+        let node = unsafe { NonNull::new_unchecked(&raw mut entry) };
+        match unsafe { self.enqueue_or_complete(node, captured_gen) } {
             WaitOutcome::Completed => (),
             WaitOutcome::Enqueued => {
                 if entry.value.swap(SIGNAL_INIT_WAITING, Ordering::AcqRel) >= SIGNAL_SIGNALED {
@@ -546,8 +558,10 @@ impl Future for AsyncNotified<'_> {
         // SAFETY: entry is pinned inside this future and the drop
         // implementation removes it from the queue.
         match unsafe {
-            this.core
-                .enqueue_or_complete(&mut this.entry, this.captured_gen)
+            this.core.enqueue_or_complete(
+                NonNull::new_unchecked(&raw mut this.entry),
+                this.captured_gen,
+            )
         } {
             WaitOutcome::Completed => {
                 this.entry.value.store(SIGNAL_RETURNED, Ordering::Relaxed);
@@ -578,7 +592,7 @@ impl AsyncNotified<'_> {
                 let found = locked.with_queue(|q| {
                     // SAFETY: queued nodes are alive under the tag-lock; our
                     // own node is compared by address only.
-                    unsafe { q.remove(NonNull::new_unchecked(&mut self.entry)) }
+                    unsafe { q.remove(NonNull::new_unchecked(&raw mut self.entry)) }
                 });
                 locked.unlock(|| {
                     self.core.state.fetch_and(!HAS_QUEUE, Ordering::AcqRel);

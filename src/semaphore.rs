@@ -166,11 +166,16 @@ impl SemCore {
                     break;
                 };
                 // SAFETY: nodes in the queue are valid; we hold the tag-lock.
-                let front_ref = unsafe { front.as_ref() };
-                let remaining = front_ref.aux.load(Ordering::Relaxed);
+                // `aux` is reached through a raw place so no reference to the
+                // whole node exists while its owner may poll it.
+                let remaining = unsafe { (*front.as_ptr()).aux.load(Ordering::Relaxed) };
                 let give = remaining.min(available);
                 available -= give;
-                front_ref.aux.store(remaining - give, Ordering::Relaxed);
+                unsafe {
+                    (*front.as_ptr())
+                        .aux
+                        .store(remaining - give, Ordering::Relaxed)
+                };
                 if remaining == give {
                     // SAFETY: queued nodes are alive under the tag-lock;
                     // popped in FIFO order right after the previous appended
@@ -211,9 +216,13 @@ impl SemCore {
     ///
     /// # Safety
     ///
-    /// `entry` must stay alive until it is signaled or removed from the
-    /// queue.
-    pub(crate) unsafe fn enqueue_or_acquire(&self, entry: &mut Signal, n: usize) -> EnqueueResult {
+    /// `entry` must point to a live node with a `None` link that stays alive
+    /// and in place until it is signaled or removed from the queue.
+    pub(crate) unsafe fn enqueue_or_acquire(
+        &self,
+        entry: NonNull<Signal>,
+        n: usize,
+    ) -> EnqueueResult {
         assert!(
             n <= MAX_PERMITS,
             "requested permits exceed MAX_PERMITS; the acquisition could never succeed"
@@ -262,7 +271,7 @@ impl SemCore {
             let first = locked.with_queue(|q| {
                 // SAFETY: forwarded caller guarantee: the entry outlives its
                 // queue membership.
-                unsafe { q.push(NonNull::new_unchecked(entry)) }
+                unsafe { q.push(entry) }
             });
             locked.unlock(|| {
                 self.pool.fetch_and(!HAS_QUEUE, Ordering::AcqRel);
@@ -342,8 +351,11 @@ impl SemCore {
         let mut entry = Signal::new_sync();
         entry.aux.store(n, Ordering::Relaxed);
         // SAFETY: the entry outlives its queue membership: this function does
-        // not return before the entry is signaled (and thereby dequeued).
-        let first = match unsafe { self.enqueue_or_acquire(&mut entry, n) } {
+        // not return before the entry is signaled (and thereby dequeued). The
+        // pointer is derived without a `&mut` to the node so the reads of
+        // `entry.value` below alias the queued node soundly.
+        let node = unsafe { NonNull::new_unchecked(&raw mut entry) };
+        let first = match unsafe { self.enqueue_or_acquire(node, n) } {
             EnqueueResult::Acquired => return Ok(()),
             EnqueueResult::Closed => return Err(AcquireError(())),
             EnqueueResult::Enqueued(first) => first,
@@ -396,55 +408,62 @@ impl SemCore {
     ///
     /// # Safety
     ///
-    /// `entry` must be pinned for the whole acquisition and, if this ever
-    /// returned `Poll::Pending`, [`Self::cancel_acquire`] must be called
-    /// before the entry is invalidated (unless the acquisition completed).
+    /// `entry` must point to a live node that stays pinned for the whole
+    /// acquisition and, if this ever returned `Poll::Pending`,
+    /// [`Self::drop_acquire`] must be called before the node is invalidated
+    /// (unless the acquisition completed).
     pub(crate) unsafe fn poll_acquire(
         &self,
-        entry: &mut Signal,
+        entry: NonNull<Signal>,
         n: usize,
         cx: &mut Context<'_>,
     ) -> Poll<Result<(), AcquireError>> {
-        let sig_val = entry.value.load(Ordering::Acquire);
+        // SAFETY (all raw accesses below): the caller guarantees the node is
+        // alive; fields are reached through raw places so no reference to the
+        // whole node is held while a signaler may touch it.
+        let node = entry.as_ptr();
+        let sig_val = unsafe { (*node).value.load(Ordering::Acquire) };
         if likely(sig_val >= SIGNAL_SIGNALED) {
             if unlikely(sig_val == SIGNAL_RETURNED) {
                 unreachable!("acquire polled after completion");
             }
-            entry.value.store(SIGNAL_RETURNED, Ordering::Relaxed);
+            unsafe { (*node).value.store(SIGNAL_RETURNED, Ordering::Relaxed) };
             if unlikely(sig_val == SIGNAL_CLOSED) {
-                let granted = n - entry.aux.load(Ordering::Relaxed);
+                let granted = n - unsafe { (*node).aux.load(Ordering::Relaxed) };
                 self.release(granted);
                 return Poll::Ready(Err(AcquireError(())));
             }
             return Poll::Ready(Ok(()));
         }
         if sig_val == SIGNAL_INIT_WAITING {
-            entry.waker.register(cx.waker());
+            unsafe { (*node).waker.register(cx.waker()) };
             return Poll::Pending;
         }
         debug_assert_eq!(sig_val, SIGNAL_UNINIT);
         match self.try_acquire(n) {
             Ok(()) => {
-                entry.value.store(SIGNAL_RETURNED, Ordering::Relaxed);
+                unsafe { (*node).value.store(SIGNAL_RETURNED, Ordering::Relaxed) };
                 return Poll::Ready(Ok(()));
             }
             Err(TryAcquireError::Closed) => {
-                entry.value.store(SIGNAL_RETURNED, Ordering::Relaxed);
+                unsafe { (*node).value.store(SIGNAL_RETURNED, Ordering::Relaxed) };
                 return Poll::Ready(Err(AcquireError(())));
             }
             Err(TryAcquireError::NoPermits) => {}
         }
-        entry.value.store(SIGNAL_INIT_WAITING, Ordering::Release);
-        entry.waker.register(cx.waker());
-        entry.aux.store(n, Ordering::Relaxed);
+        unsafe {
+            (*node).value.store(SIGNAL_INIT_WAITING, Ordering::Release);
+            (*node).waker.register(cx.waker());
+            (*node).aux.store(n, Ordering::Relaxed);
+        }
         // SAFETY: forwarded caller guarantee (pin + cancel-on-drop).
         match unsafe { self.enqueue_or_acquire(entry, n) } {
             EnqueueResult::Acquired => {
-                entry.value.store(SIGNAL_RETURNED, Ordering::Relaxed);
+                unsafe { (*node).value.store(SIGNAL_RETURNED, Ordering::Relaxed) };
                 Poll::Ready(Ok(()))
             }
             EnqueueResult::Closed => {
-                entry.value.store(SIGNAL_RETURNED, Ordering::Relaxed);
+                unsafe { (*node).value.store(SIGNAL_RETURNED, Ordering::Relaxed) };
                 Poll::Ready(Err(AcquireError(())))
             }
             EnqueueResult::Enqueued(_) => Poll::Pending,
@@ -463,8 +482,11 @@ impl SemCore {
     /// be used afterwards.
     #[cold]
     #[inline(never)]
-    pub(crate) unsafe fn drop_acquire(&self, entry: &mut Signal, n: usize) {
-        match entry.value.load(Ordering::Acquire) {
+    pub(crate) unsafe fn drop_acquire(&self, entry: NonNull<Signal>, n: usize) {
+        // SAFETY: forwarded caller guarantee (the node is alive); raw place
+        // accesses, see `poll_acquire`.
+        let node = entry.as_ptr();
+        match unsafe { (*node).value.load(Ordering::Acquire) } {
             SIGNAL_INIT_WAITING => {
                 // SAFETY: forwarded caller guarantee.
                 unsafe { self.cancel_acquire(entry, n) }
@@ -472,7 +494,7 @@ impl SemCore {
             // Granted but never observed by a poll: give the permits back.
             SIGNAL_SIGNALED => self.release(n),
             SIGNAL_CLOSED => {
-                let granted = n - entry.aux.load(Ordering::Relaxed);
+                let granted = n - unsafe { (*node).aux.load(Ordering::Relaxed) };
                 self.release(granted);
             }
             // SIGNAL_UNINIT (never enqueued) or SIGNAL_RETURNED (completed).
@@ -489,17 +511,20 @@ impl SemCore {
     /// # Safety
     ///
     /// `entry` must be the same entry passed to `poll_acquire`.
-    unsafe fn cancel_acquire(&self, entry: &mut Signal, n: usize) {
+    unsafe fn cancel_acquire(&self, entry: NonNull<Signal>, n: usize) {
+        // SAFETY: forwarded caller guarantee (the node is alive); raw place
+        // accesses, see `poll_acquire`.
+        let node = entry.as_ptr();
         if let Some(mut locked) = self.queue.lock(false) {
             let found = locked.with_queue(|q| {
                 // SAFETY: queued nodes are alive under the tag-lock; our own
                 // node may or may not be queued and is compared by address
                 // only.
-                unsafe { q.remove(NonNull::new_unchecked(entry)) }
+                unsafe { q.remove(entry) }
             });
             if found {
                 // Permits partially assigned to us must be redistributed.
-                let granted = n - entry.aux.load(Ordering::Relaxed);
+                let granted = n - unsafe { (*node).aux.load(Ordering::Relaxed) };
                 locked.unlock(|| {
                     self.pool.fetch_and(!HAS_QUEUE, Ordering::AcqRel);
                 });
@@ -513,13 +538,13 @@ impl SemCore {
         // We were already popped by a signaler; the signal is in flight.
         // Wait for it and give the granted permits back.
         let backoff = Backoff::new();
-        let mut value = entry.value.load(Ordering::Acquire);
+        let mut value = unsafe { (*node).value.load(Ordering::Acquire) };
         while value < SIGNAL_SIGNALED {
             backoff.snooze();
-            value = entry.value.load(Ordering::Acquire);
+            value = unsafe { (*node).value.load(Ordering::Acquire) };
         }
         let granted = if value == SIGNAL_CLOSED {
-            n - entry.aux.load(Ordering::Relaxed)
+            n - unsafe { (*node).aux.load(Ordering::Relaxed) }
         } else {
             n
         };
@@ -971,8 +996,9 @@ impl<'a> Future for AsyncAcquireRequest<'a> {
         let core = this.core;
         let permits = this.permits;
         // SAFETY: the entry is pinned inside this future and
-        // `cancel_acquire` runs on drop.
-        match unsafe { core.poll_acquire(&mut this.entry, permits, cx) } {
+        // `drop_acquire` runs on drop.
+        match unsafe { core.poll_acquire(NonNull::new_unchecked(&raw mut this.entry), permits, cx) }
+        {
             Poll::Ready(Ok(())) => Poll::Ready(Ok(SemaphorePermit { core, permits })),
             Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
             Poll::Pending => Poll::Pending,
@@ -985,7 +1011,10 @@ impl Drop for AsyncAcquireRequest<'_> {
         let value = self.entry.value.load(Ordering::Acquire);
         if unlikely(value != SIGNAL_UNINIT && value != SIGNAL_RETURNED) {
             // SAFETY: same entry as passed to poll_acquire.
-            unsafe { self.core.drop_acquire(&mut self.entry, self.permits) };
+            unsafe {
+                self.core
+                    .drop_acquire(NonNull::new_unchecked(&raw mut self.entry), self.permits)
+            };
         }
     }
 }

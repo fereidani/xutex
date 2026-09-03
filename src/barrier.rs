@@ -115,8 +115,10 @@ impl BarrierCore {
         let mut chain = PoppedChain::new();
         locked.with_queue(|q| {
             while let Some(front) = q.first::<Signal>() {
-                // SAFETY: queued nodes are valid under the tag-lock.
-                if unsafe { front.as_ref() }.aux.load(Ordering::Relaxed) != generation {
+                // SAFETY: queued nodes are valid under the tag-lock; `aux` is
+                // read through a raw place so no reference to the whole node
+                // is formed.
+                if unsafe { (*front.as_ptr()).aux.load(Ordering::Relaxed) } != generation {
                     // Waiters of the next generation; FIFO order guarantees
                     // our generation forms a prefix.
                     break;
@@ -137,8 +139,9 @@ impl BarrierCore {
     ///
     /// # Safety
     ///
-    /// `entry` must stay alive until it is signaled or removed.
-    unsafe fn enqueue_or_complete(&self, entry: &mut Signal, generation: usize) -> WaitOutcome {
+    /// `entry` must point to a live node with a `None` link that stays alive
+    /// and in place until it is signaled or removed.
+    unsafe fn enqueue_or_complete(&self, entry: NonNull<Signal>, generation: usize) -> WaitOutcome {
         let mut locked = self.queue.lock(true).unwrap();
         // An RMW returns the latest state: either the leader's reset is
         // visible here (round complete, don't park), or our enqueue is
@@ -149,10 +152,12 @@ impl BarrierCore {
             locked.unlock(|| {});
             return WaitOutcome::Completed;
         }
-        entry.aux.store(generation, Ordering::Relaxed);
+        // SAFETY: forwarded caller guarantee; `aux` is written through a raw
+        // place so no reference to the whole node is formed.
+        unsafe { (*entry.as_ptr()).aux.store(generation, Ordering::Relaxed) };
         locked.with_queue(|q| {
             // SAFETY: forwarded caller guarantee.
-            unsafe { q.push(NonNull::new_unchecked(entry)) }
+            unsafe { q.push(entry) }
         });
         locked.unlock(|| {});
         WaitOutcome::Enqueued
@@ -169,8 +174,11 @@ impl BarrierCore {
             ArriveOutcome::Wait { generation } => {
                 let mut entry = Signal::new_sync();
                 // SAFETY: the entry outlives its queue membership: we do not
-                // return before it is signaled.
-                match unsafe { self.enqueue_or_complete(&mut entry, generation) } {
+                // return before it is signaled. The pointer is derived without
+                // a `&mut` to the node so the reads of `entry.value` below
+                // alias the queued node soundly.
+                let node = unsafe { NonNull::new_unchecked(&raw mut entry) };
+                match unsafe { self.enqueue_or_complete(node, generation) } {
                     WaitOutcome::Completed => BarrierWaitResult { is_leader: false },
                     WaitOutcome::Enqueued => {
                         if entry.value.swap(SIGNAL_INIT_WAITING, Ordering::AcqRel) >= SIGNAL_ALL {
@@ -470,7 +478,12 @@ impl Future for AsyncBarrierWaitRequest<'_> {
                 this.entry.waker.register(cx.waker());
                 // SAFETY: entry is pinned inside this future and the drop
                 // implementation removes it from the queue.
-                match unsafe { this.core.enqueue_or_complete(&mut this.entry, generation) } {
+                match unsafe {
+                    this.core.enqueue_or_complete(
+                        NonNull::new_unchecked(&raw mut this.entry),
+                        generation,
+                    )
+                } {
                     WaitOutcome::Completed => {
                         this.entry.value.store(SIGNAL_RETURNED, Ordering::Relaxed);
                         Poll::Ready(BarrierWaitResult { is_leader: false })
@@ -517,7 +530,7 @@ impl AsyncBarrierWaitRequest<'_> {
                             // SAFETY: queued nodes are alive under the
                             // tag-lock; our own node is compared by address
                             // only.
-                            unsafe { q.remove(NonNull::new_unchecked(&mut self.entry)) }
+                            unsafe { q.remove(NonNull::new_unchecked(&raw mut self.entry)) }
                         });
                         locked.unlock(|| {});
                         if found {
