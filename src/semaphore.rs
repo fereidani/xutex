@@ -161,33 +161,34 @@ impl SemCore {
 
         let mut chain = PoppedChain::new();
         locked.with_queue(|queue| {
-            while available > 0 {
-                let Some(front) = queue.first::<Signal>() else {
-                    break;
-                };
+            while let Some(front) = queue.first::<Signal>() {
                 // SAFETY: nodes in the queue are valid; we hold the tag-lock.
                 // `aux` is reached through a raw place so no reference to the
                 // whole node exists while its owner may poll it.
                 let remaining = unsafe { (*front.as_ptr()).aux.load(Ordering::Relaxed) };
-                let give = remaining.min(available);
-                available -= give;
-                unsafe {
-                    (*front.as_ptr())
-                        .aux
-                        .store(remaining - give, Ordering::Relaxed)
-                };
-                if remaining == give {
-                    // SAFETY: queued nodes are alive under the tag-lock;
-                    // popped in FIFO order right after the previous appended
-                    // node.
-                    unsafe {
-                        let node = queue.pop().unwrap();
-                        chain.append(node);
+                if remaining > available {
+                    // The head still needs more than we have: assign what is
+                    // there and stop, it blocks everyone behind it (FIFO
+                    // fairness, like tokio).
+                    if available > 0 {
+                        unsafe {
+                            (*front.as_ptr())
+                                .aux
+                                .store(remaining - available, Ordering::Relaxed)
+                        };
+                        available = 0;
                     }
-                } else {
-                    // The front waiter still needs more permits; it blocks
-                    // everyone behind it (FIFO fairness, like tokio).
                     break;
+                }
+                // Satisfied. This includes heads that need nothing more, e.g.
+                // an `acquire_many(0)` that queued behind other waiters.
+                available -= remaining;
+                unsafe { (*front.as_ptr()).aux.store(0, Ordering::Relaxed) };
+                // SAFETY: see above; popped in FIFO order right after the
+                // previous appended node.
+                unsafe {
+                    let node = queue.pop().unwrap();
+                    chain.append(node);
                 }
             }
         });
@@ -520,19 +521,30 @@ impl SemCore {
         // accesses, see `poll_acquire`.
         let node = entry.as_ptr();
         if let Some(mut locked) = self.queue.lock(false) {
-            let found = locked.with_queue(|q| {
+            let (found, head_changed) = locked.with_queue(|q| {
+                let was_head = q.first::<Signal>() == Some(entry);
                 // SAFETY: queued nodes are alive under the tag-lock; our own
                 // node may or may not be queued and is compared by address
                 // only.
-                unsafe { q.remove(entry) }
+                let found = unsafe { q.remove(entry) };
+                (found, found && was_head && !q.is_empty())
             });
             if found {
-                // Permits partially assigned to us must be redistributed.
                 let granted = n - unsafe { (*node).aux.load(Ordering::Relaxed) };
                 locked.unlock(|| {
                     self.pool.fetch_and(!HAS_QUEUE, Ordering::AcqRel);
                 });
-                self.release(granted);
+                if granted > 0 {
+                    // Permits partially assigned to us must be redistributed;
+                    // `release` drains the queue for the waiters behind us.
+                    self.release(granted);
+                } else if head_changed {
+                    // We were at the head of the line with nothing assigned
+                    // yet, so the permits we were waiting for may already sit
+                    // in the pool: the new head must be given its chance at
+                    // them, which only a drain does.
+                    self.drain();
+                }
                 return;
             }
             locked.unlock(|| {

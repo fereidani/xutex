@@ -807,3 +807,78 @@ fn test_async_once_cell_tokio() {
         assert!(values.iter().all(|v| v == &values[0]));
     });
 }
+
+// ---------------------------------------------------------------------------
+// Regressions: cancelled head-of-line waiters must not strand the queue
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_async_semaphore_cancelled_head_redrains_queue() {
+    let sem = AsyncSemaphore::new(2);
+    let small = sem.acquire();
+    pin_mut!(small);
+    {
+        // Head of the line: needs more than the pool holds, so it parks while
+        // the two permits stay in the pool.
+        let big = sem.acquire_many(3);
+        pin_mut!(big);
+        assert!(poll_once(big.as_mut()).is_pending());
+        // FIFO: queued behind it although its single permit is available.
+        assert!(poll_once(small.as_mut()).is_pending());
+        assert_eq!(sem.available_permits(), 2);
+    } // `big` cancelled: the new head must be matched against the pool again
+    match poll_once(small.as_mut()) {
+        Poll::Ready(Ok(p)) => {
+            assert_eq!(p.num_permits(), 1);
+            assert_eq!(sem.available_permits(), 1);
+        }
+        _ => panic!("waiter stranded behind a cancelled acquire_many"),
+    }
+    assert_eq!(sem.available_permits(), 2);
+}
+
+#[test]
+fn test_async_rwlock_cancelled_writer_unblocks_queued_reader() {
+    let lock = AsyncRwLock::new(0);
+    let r1 = lock.try_read().unwrap();
+    let r2 = lock.read();
+    pin_mut!(r2);
+    {
+        let w = lock.write();
+        pin_mut!(w);
+        assert!(poll_once(w.as_mut()).is_pending()); // waits for r1
+        assert!(poll_once(r2.as_mut()).is_pending()); // fair: behind the writer
+    } // writer cancelled (e.g. by a timeout)
+    assert!(
+        poll_once(r2.as_mut()).is_ready(),
+        "reader stranded behind a cancelled writer"
+    );
+    drop(r1);
+    assert!(lock.try_write().is_some());
+}
+
+#[test]
+fn test_async_semaphore_zero_permit_request_behind_queue() {
+    let sem = AsyncSemaphore::new(1);
+    let held = sem.try_acquire().unwrap();
+    let one = sem.acquire();
+    pin_mut!(one);
+    assert!(poll_once(one.as_mut()).is_pending());
+    let zero = sem.acquire_many(0);
+    pin_mut!(zero);
+    // FIFO: even a request for nothing queues behind an existing waiter.
+    assert!(poll_once(zero.as_mut()).is_pending());
+    // Handing the permit to `one` leaves nothing in the pool, but `zero` needs
+    // nothing and must be released in the same drain.
+    drop(held);
+    let p1 = match poll_once(one.as_mut()) {
+        Poll::Ready(Ok(p)) => p,
+        _ => panic!("first waiter must get the permit"),
+    };
+    match poll_once(zero.as_mut()) {
+        Poll::Ready(Ok(p)) => assert_eq!(p.num_permits(), 0),
+        _ => panic!("zero-permit waiter stranded"),
+    }
+    drop(p1);
+    assert_eq!(sem.available_permits(), 1);
+}
