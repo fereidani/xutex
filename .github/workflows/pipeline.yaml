@@ -31,6 +31,8 @@ jobs:
         run: rustup component add clippy
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Run Clippy (No Default Features)
+        run: cargo clippy --workspace --lib --no-default-features -- -D warnings
   cargo_test:
     name: "Cargo Test"
     runs-on: ubuntu-latest
