@@ -144,8 +144,13 @@ impl SignalQueue {
     }
 
     /// Pops a node from the front of the queue.
+    ///
+    /// # Safety
+    ///
+    /// Every node in the queue must have been pushed as an `N` (see
+    /// [`push`](Self::push)) and must still be alive.
     #[inline(always)]
-    pub fn pop<N: Node>(&mut self) -> Option<NonNull<N>> {
+    pub unsafe fn pop<N: Node>(&mut self) -> Option<NonNull<N>> {
         // Take the first element; return None if the queue is empty.
         let first = typed::<N>(self.first)?;
         // SAFETY: `first` is a valid node because it came from `push`.
@@ -166,8 +171,13 @@ impl SignalQueue {
 
     /// Removes a specific node from the queue.
     /// Returns true if the node was found and removed, false otherwise.
+    ///
+    /// # Safety
+    ///
+    /// Same requirements as [`pop`](Self::pop); `entry` is only compared by
+    /// address and need not be queued.
     #[inline(always)]
-    pub fn remove<N: Node>(&mut self, entry: NonNull<N>) -> bool {
+    pub unsafe fn remove<N: Node>(&mut self, entry: NonNull<N>) -> bool {
         let mut cur = typed::<N>(self.first);
         let mut prev: Option<NonNull<N>> = None;
         while let Some(cur_ptr) = cur {
@@ -365,11 +375,13 @@ mod tests {
             assert!(!q.push(c));
         }
         assert_eq!(value_of(q.first()), 1);
-        assert!(q.remove(b));
-        assert!(!q.remove(b));
-        assert_eq!(value_of(q.pop()), 1);
-        assert_eq!(value_of(q.pop()), 3);
-        assert!(q.pop::<TestNode>().is_none());
+        unsafe {
+            assert!(q.remove(b));
+            assert!(!q.remove(b));
+            assert_eq!(value_of(q.pop()), 1);
+            assert_eq!(value_of(q.pop()), 3);
+            assert!(q.pop::<TestNode>().is_none());
+        }
         assert!(q.is_empty());
     }
 

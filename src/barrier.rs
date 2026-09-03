@@ -121,9 +121,11 @@ impl BarrierCore {
                     // our generation forms a prefix.
                     break;
                 }
-                let node = q.pop().unwrap();
-                // SAFETY: FIFO pop order.
-                unsafe { chain.append(node) };
+                // SAFETY: see above; FIFO pop order.
+                unsafe {
+                    let node = q.pop().unwrap();
+                    chain.append(node);
+                }
             }
         });
         chain.seal();
@@ -512,8 +514,10 @@ impl AsyncBarrierWaitRequest<'_> {
                     // completion sneaked in between — handled below.
                     if let Some(mut locked) = self.core.queue.lock(false) {
                         let found = locked.with_queue(|q| {
-                            // SAFETY: node address comparison only.
-                            q.remove(unsafe { NonNull::new_unchecked(&mut self.entry) })
+                            // SAFETY: queued nodes are alive under the
+                            // tag-lock; our own node is compared by address
+                            // only.
+                            unsafe { q.remove(NonNull::new_unchecked(&mut self.entry)) }
                         });
                         locked.unlock(|| {});
                         if found {

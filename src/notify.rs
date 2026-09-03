@@ -156,7 +156,8 @@ impl NotifyCore {
             if cur & HAS_QUEUE != 0 {
                 match self.queue.lock(false) {
                     Some(mut locked) => {
-                        let popped = locked.with_queue(|q| q.pop());
+                        // SAFETY: queued nodes are alive under the tag-lock.
+                        let popped = locked.with_queue(|q| unsafe { q.pop() });
                         locked.unlock(|| {
                             self.state.fetch_and(!HAS_QUEUE, Ordering::AcqRel);
                         });
@@ -218,9 +219,11 @@ impl NotifyCore {
                 if unsafe { front.as_ref() }.aux.load(Ordering::Relaxed) == live_gen {
                     break;
                 }
-                let node = q.pop().unwrap();
-                // SAFETY: FIFO pop order.
-                unsafe { chain.append(node) };
+                // SAFETY: see above; FIFO pop order.
+                unsafe {
+                    let node = q.pop().unwrap();
+                    chain.append(node);
+                }
             }
         });
         chain.seal();
@@ -573,8 +576,9 @@ impl AsyncNotified<'_> {
             // Try to leave the wait queue.
             if let Some(mut locked) = self.core.queue.lock(false) {
                 let found = locked.with_queue(|q| {
-                    // SAFETY: node address comparison only.
-                    q.remove(unsafe { NonNull::new_unchecked(&mut self.entry) })
+                    // SAFETY: queued nodes are alive under the tag-lock; our
+                    // own node is compared by address only.
+                    unsafe { q.remove(NonNull::new_unchecked(&mut self.entry)) }
                 });
                 locked.unlock(|| {
                     self.core.state.fetch_and(!HAS_QUEUE, Ordering::AcqRel);

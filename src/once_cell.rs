@@ -81,8 +81,9 @@ impl OnceCore {
         };
         let mut chain = PoppedChain::new();
         locked.with_queue(|q| {
-            while let Some(node) = q.pop() {
-                // SAFETY: FIFO pop order.
+            // SAFETY: queued nodes are alive under the tag-lock; FIFO pop
+            // order.
+            while let Some(node) = unsafe { q.pop() } {
                 unsafe { chain.append(node) };
             }
         });
@@ -106,7 +107,8 @@ impl OnceCore {
         let Some(mut locked) = self.queue.lock(false) else {
             return;
         };
-        let popped = locked.with_queue(|q| q.pop());
+        // SAFETY: queued nodes are alive under the tag-lock.
+        let popped = locked.with_queue(|q| unsafe { q.pop() });
         locked.unlock(|| {});
         if let Some(node) = popped {
             // SAFETY: popped under the tag-lock, exclusively ours.
@@ -148,8 +150,9 @@ impl OnceCore {
     unsafe fn cancel_wait(&self, entry: &mut Signal) {
         if let Some(mut locked) = self.queue.lock(false) {
             let found = locked.with_queue(|q| {
-                // SAFETY: node address comparison only.
-                q.remove(unsafe { NonNull::new_unchecked(entry) })
+                // SAFETY: queued nodes are alive under the tag-lock; our own
+                // node is compared by address only.
+                unsafe { q.remove(NonNull::new_unchecked(entry)) }
             });
             locked.unlock(|| {});
             if found {

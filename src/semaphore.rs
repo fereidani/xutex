@@ -172,10 +172,13 @@ impl SemCore {
                 available -= give;
                 front_ref.aux.store(remaining - give, Ordering::Relaxed);
                 if remaining == give {
-                    let node = queue.pop().unwrap();
-                    // SAFETY: popped in FIFO order right after the previous
-                    // appended node.
-                    unsafe { chain.append(node) };
+                    // SAFETY: queued nodes are alive under the tag-lock;
+                    // popped in FIFO order right after the previous appended
+                    // node.
+                    unsafe {
+                        let node = queue.pop().unwrap();
+                        chain.append(node);
+                    }
                 } else {
                     // The front waiter still needs more permits; it blocks
                     // everyone behind it (FIFO fairness, like tokio).
@@ -280,8 +283,9 @@ impl SemCore {
             };
             let mut chain = PoppedChain::new();
             locked.with_queue(|queue| {
-                while let Some(node) = queue.pop() {
-                    // SAFETY: FIFO pop order.
+                // SAFETY: queued nodes are alive under the tag-lock; FIFO pop
+                // order.
+                while let Some(node) = unsafe { queue.pop() } {
                     unsafe { chain.append(node) };
                 }
             });
@@ -488,9 +492,10 @@ impl SemCore {
     unsafe fn cancel_acquire(&self, entry: &mut Signal, n: usize) {
         if let Some(mut locked) = self.queue.lock(false) {
             let found = locked.with_queue(|q| {
-                // SAFETY: entry may or may not be in this queue; remove
-                // compares node addresses only.
-                q.remove(unsafe { NonNull::new_unchecked(entry) })
+                // SAFETY: queued nodes are alive under the tag-lock; our own
+                // node may or may not be queued and is compared by address
+                // only.
+                unsafe { q.remove(NonNull::new_unchecked(entry)) }
             });
             if found {
                 // Permits partially assigned to us must be redistributed.
