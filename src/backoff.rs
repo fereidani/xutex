@@ -2,9 +2,6 @@ use core::cell::Cell;
 #[cfg(all(feature = "std", not(loom)))]
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-#[cfg(all(feature = "std", not(loom)))]
-use branches::likely;
-
 /// Backoff implements an exponential back‑off strategy used by
 /// synchronization primitives to reduce contention.
 ///
@@ -15,61 +12,54 @@ use branches::likely;
 /// before yielding, while on a single‑core system it yields
 /// immediately.
 ///
+/// Constructing a `Backoff` is free (it only zeroes a counter), so it can
+/// be created eagerly at the top of a function that usually never spins:
+/// the parallelism lookup that picks the spinning strategy is deferred to
+/// the first [`snooze`](Self::snooze), which is kept out of line so hot
+/// callers do not carry the spin/yield machinery inline.
+///
 /// # Fields
 ///
 /// * `spin` – A `Cell<u32>` tracking the current back‑off step.
-/// * `snooze_fn` – Function pointer to the appropriate snooze implementation
-///   for the current hardware configuration.
 ///
 /// # Methods
 ///
-/// * `new()` – Creates a new `Backoff` instance, selecting the appropriate
-///   snooze function based on the system's parallelism.
-/// * `snooze()` – Executes the selected snooze function, advancing the back‑off
-///   state.
-/// * `snooze_multi_core()` – Internal implementation used when more than one
-///   CPU core is available. It spins for a number of iterations that grows
+/// * `new()` – Creates a new `Backoff` instance.
+/// * `snooze()` – Executes one back‑off step, advancing the state. On a
+///   multi‑core system it spins for a number of iterations that grows
 ///   exponentially (up to a limit) and then yields the thread once the spin
-///   count exceeds a threshold.
-/// * `snooze_single_core()` – Internal implementation used on a single‑core
-///   system; it simply yields the thread on each call as spinning in
-///   single-core environment only wastes CPU cycles.
+///   count exceeds a threshold; on a single‑core system it yields the thread on
+///   each call as spinning there only wastes CPU cycles.
 /// * `is_completed()` – Returns `true` when the back‑off has spun beyond a
 ///   predefined limit, indicating that the caller should give up or take an
 ///   alternative action.
 pub(crate) struct Backoff {
-    #[allow(dead_code)]
     spin: Cell<u32>,
-    #[cfg(all(feature = "std", not(loom)))]
-    snooze_fn: fn(&Self),
 }
 
-#[cfg(all(not(feature = "std"), not(loom)))]
 impl Backoff {
     #[inline(always)]
     pub fn new() -> Self {
         Self { spin: Cell::new(0) }
     }
+}
 
-    #[inline(always)]
+#[cfg(all(not(feature = "std"), not(loom)))]
+impl Backoff {
+    /// In no-std environments the thread cannot be yielded, so every step is
+    /// a bounded spin loop.
+    #[inline(never)]
     pub fn snooze(&self) {
-        // In no-std environments, we cannot yield the thread, so we just
-        // perform a spin loop.
         let spin: u32 = self.spin.get();
-        for _ in 0..(1 << spin.min(5)) {
+        for _ in 0..(1u32 << spin.min(5)) {
             core::hint::spin_loop();
         }
-        self.spin.set(spin + 1);
+        self.spin.set(spin.saturating_add(1));
     }
 }
 
 #[cfg(loom)]
 impl Backoff {
-    #[inline(always)]
-    pub fn new() -> Self {
-        Self { spin: Cell::new(0) }
-    }
-
     /// Under loom every snooze is a plain scheduler yield so the model
     /// checker can explore interleavings without a state-space explosion.
     /// The iteration guard turns a runaway spin (livelock) into a panic with
@@ -92,40 +82,24 @@ impl Backoff {
 
 #[cfg(all(feature = "std", not(loom)))]
 impl Backoff {
-    #[inline(always)]
-    pub fn new() -> Self {
-        Self {
-            spin: Cell::new(0),
-            snooze_fn: if get_parallelism() > 1 {
-                Self::snooze_multi_core
-            } else {
-                Self::snooze_single_core
-            },
-        }
-    }
-
-    #[inline(always)]
+    /// One back-off step: a short `spin_loop` burst that doubles each call
+    /// for the first few calls on a multi-core machine, a thread yield
+    /// otherwise.
+    ///
+    /// Deliberately not inlined: it only ever runs on contended paths, and
+    /// keeping it out of line keeps the parallelism lookup and the yield
+    /// syscall out of every generic instantiation that merely *might* spin.
+    #[inline(never)]
     pub fn snooze(&self) {
-        (self.snooze_fn)(self);
-    }
-
-    #[inline(always)]
-    fn snooze_multi_core(&self) {
         let spin: u32 = self.spin.get();
-        if spin <= 6 {
-            for _ in 0..(1 << spin.min(5)) {
+        self.spin.set(spin.saturating_add(1));
+        if spin <= 6 && get_parallelism() > 1 {
+            for _ in 0..(1u32 << spin.min(5)) {
                 core::hint::spin_loop();
             }
         } else {
             std::thread::yield_now();
         }
-        self.spin.set(spin + 1);
-    }
-
-    #[inline(always)]
-    fn snooze_single_core(&self) {
-        std::thread::yield_now();
-        self.spin.set(self.spin.get() + 1);
     }
 
     #[inline(always)]
@@ -139,27 +113,32 @@ impl Backoff {
 /// The value is cached in a static `AtomicUsize` so the expensive
 /// `std::thread::available_parallelism()` call is performed only once.
 /// The first thread that observes an uninitialized value (`0`) computes the
-/// parallelism and stores it with a release store; subsequent calls take the
-/// fast‑path load.
-///
-/// This function is deliberately `#[inline(always)]` because it is used in
-/// hot paths (e.g. spin‑backoff) where the overhead of a function call would
-/// be noticeable.
+/// parallelism and stores it; subsequent calls take the fast‑path load.
 #[inline(always)]
 #[cfg(all(feature = "std", not(loom)))]
 pub fn get_parallelism() -> usize {
     static PARALLELISM: AtomicUsize = AtomicUsize::new(0);
 
     let cached = PARALLELISM.load(Ordering::Relaxed);
-    if likely(cached != 0) {
+    if cached != 0 {
         return cached;
     }
+    init_parallelism(&PARALLELISM)
+}
 
+/// Cold half of [`get_parallelism`]: the `available_parallelism` call and
+/// the drop of its `io::Error` stay out of line so they are not duplicated
+/// into every caller.
+#[cold]
+#[inline(never)]
+#[cfg(all(feature = "std", not(loom)))]
+fn init_parallelism(slot: &AtomicUsize) -> usize {
     let parallelism = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1);
-
-    PARALLELISM.store(parallelism, Ordering::Release);
+    // Racing initializers store the same value; Relaxed is enough because
+    // the value is only ever used as a heuristic.
+    slot.store(parallelism, Ordering::Relaxed);
     parallelism
 }
 
@@ -169,4 +148,23 @@ pub fn get_parallelism() -> usize {
 #[allow(dead_code)]
 pub fn get_parallelism() -> usize {
     2
+}
+
+#[cfg(all(test, not(loom)))]
+mod tests {
+    use super::*;
+
+    /// Constructing a `Backoff` must stay free: it is created eagerly at the
+    /// top of fast paths that usually never spin, so it must not carry a
+    /// function pointer or any lookup that has to run before the fast path.
+    #[test]
+    fn backoff_is_a_bare_counter() {
+        assert_eq!(core::mem::size_of::<Backoff>(), core::mem::size_of::<u32>());
+        let backoff = Backoff::new();
+        for _ in 0..40 {
+            backoff.snooze();
+        }
+        #[cfg(feature = "std")]
+        assert!(backoff.is_completed());
+    }
 }
