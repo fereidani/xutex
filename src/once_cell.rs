@@ -864,6 +864,11 @@ impl<T, F, Fut> Drop for AsyncGetOrTryInit<'_, T, F, Fut> {
         if likely(value == SIGNAL_UNINIT || value == SIGNAL_RETURNED) {
             return;
         }
+        if value == SIGNAL_SIGNALED {
+            // The value was published and we never got to observe it: the
+            // cell is READY for everyone, nothing to hand over.
+            return;
+        }
         if value == SIGNAL_RETRY {
             // Chosen to take over but dropped: pass the role on.
             self.internal.core.wake_one_retry();
