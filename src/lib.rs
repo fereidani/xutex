@@ -715,14 +715,8 @@ impl<T> Mutex<T> {
         if let Some(guard) = self.internal.try_lock() {
             return guard;
         }
-        if unlikely(
-            self.internal
-                .queue
-                .compare_exchange(UNLOCKED, LOCKED, Ordering::Acquire, Ordering::Relaxed)
-                .is_err(),
-        ) {
-            self.lock_slow();
-        }
+        self.lock_slow();
+        // SAFETY: `lock_slow` returns only once the lock is ours.
         unsafe { self.internal.create_guard() }
     }
 
