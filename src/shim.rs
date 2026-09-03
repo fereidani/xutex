@@ -192,6 +192,7 @@ pub(crate) mod spin {
             self.0.store(value, up(order))
         }
 
+        #[cfg(any(feature = "std", loom))]
         #[inline(always)]
         pub(crate) fn swap(&self, value: usize, order: Ordering) -> usize {
             self.0.swap(value, up(order))

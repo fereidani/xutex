@@ -163,11 +163,6 @@ pub fn get_parallelism() -> usize {
     parallelism
 }
 
-#[cfg(all(not(feature = "std"), not(loom)))]
-pub fn get_parallelism() -> usize {
-    1
-}
-
 /// Fixed parallelism under loom: the pool allocator is bypassed and the
 /// backoff never consults this, but keep the symbol available.
 #[cfg(loom)]
